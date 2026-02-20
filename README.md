@@ -30,6 +30,9 @@ You can:
 - Optionally enable image, audio, and video understanding for richer queries.
 
 ---
+<p align="center">
+  <img src="assets/EpsteinGPT-FrontEnd.png" alt="Epstein-GPT Front-End Screenshot" width="100%">
+</p>
 
 ## Why this project matters
 
@@ -171,6 +174,10 @@ Modify `Config` to fit your environment before running.
 
 ## Running the backend
 
+<p align="center">
+  <img src="assets/EpsteinGPTBackend.png" alt="Epstein-GPT Back-End Screenshot" width="100%">
+</p>
+
 Launch the full stack by running `EpsteinGPTv2.py`:
 
 ```bash
@@ -311,6 +318,10 @@ Typical client logic:
 ---
 
 ## Streamlit chat app (for non‑technical users)
+
+<p align="center">
+  <img src="assets/appdotpybackend.png" alt="Epstein-GPT streamlit chat app back-end screenshot" width="100%">
+</p>
 
 For non‑technical users, the easiest way to use EpsteinGPT is via a simple chat interface in your browser.
 
