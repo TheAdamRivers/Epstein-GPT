@@ -332,7 +332,7 @@ import streamlit as st
 API_URL = "http://localhost:8000/chat/completions"
 SESSION_ID = "default"
 REQUEST_TIMEOUT = 300  # seconds
-MAX_HISTORY_MESSAGES = 10  # keep last N turns for latency
+MAX_HISTORY_MESSAGES = 6  # keep last N turns for latency
 
 
 # ---------- Page config & global styling ----------
@@ -343,7 +343,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Global theming / layout tweaks
 st.markdown(
     """
     <style>
@@ -351,7 +350,6 @@ st.markdown(
         background: radial-gradient(circle at top left, #1f2937 0, #020617 55%);
         color: #e5e7eb;
     }
-    /* Hide default padding at the top */
     .block-container {
         padding-top: 1rem;
         padding-bottom: 1.5rem;
@@ -402,12 +400,11 @@ st.markdown(
     .synthic-footer a:hover {
         text-decoration: underline;
     }
-    /* Chat tweaks */
     .stChatMessage {
         font-size: 0.95rem;
         line-height: 1.55;
     }
-    .st-emotion-cache-1r6slb0 {  /* chat input container */
+    .st-emotion-cache-1r6slb0 {
         border-top: 1px solid rgba(148, 163, 184, 0.35);
         padding-top: 0.5rem;
     }
@@ -437,7 +434,7 @@ st.markdown(
 if "temperature" not in st.session_state:
     st.session_state.temperature = 0.7
 if "max_tokens" not in st.session_state:
-    st.session_state.max_tokens = 256
+    st.session_state.max_tokens = 192
 if "persona" not in st.session_state:
     st.session_state.persona = "Epistemic analyst"
 
@@ -451,22 +448,17 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Assistant style")
 
+    persona_options = [
+        "Epistemic analyst",
+        "Dry researcher",
+        "Explainer for non‑technical users",
+        "Custom",
+    ]
     persona = st.selectbox(
         "Persona",
-        [
-            "Epistemic analyst",
-            "Dry researcher",
-            "Explainer for non‑technical users",
-            "Custom",
-        ],
-        index=["Epistemic analyst", "Dry researcher",
-               "Explainer for non‑technical users", "Custom"].index(st.session_state.persona)
-        if st.session_state.persona in [
-            "Epistemic analyst",
-            "Dry researcher",
-            "Explainer for non‑technical users",
-            "Custom",
-        ]
+        persona_options,
+        index=persona_options.index(st.session_state.persona)
+        if st.session_state.persona in persona_options
         else 0,
     )
     st.session_state.persona = persona
@@ -509,7 +501,7 @@ with st.sidebar:
         "Temperature", 0.0, 1.0, st.session_state.temperature, 0.05
     )
     st.session_state.max_tokens = st.slider(
-        "Max response tokens", 32, 512, st.session_state.max_tokens, 16
+        "Max response tokens", 32, 256, st.session_state.max_tokens, 16
     )
 
     fast_mode = st.checkbox("Fast mode (shorter answers)", value=True)
@@ -518,10 +510,15 @@ with st.sidebar:
     st.markdown("#### Session")
     if st.button("🧹 Clear conversation"):
         st.session_state.messages = []
-        st.experimental_rerun()
+        st.rerun()
 
 
 # ---------- Backend helpers ----------
+
+def _truncate_text(t: str, max_chars: int = 800) -> str:
+    t = t.strip()
+    return t[:max_chars] if len(t) > max_chars else t
+
 
 def build_backend_messages(history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     """
@@ -552,7 +549,7 @@ def build_backend_messages(history: List[Dict[str, str]]) -> List[Dict[str, Any]
                 "content": [
                     {
                         "type": "text",
-                        "text": msg["content"],
+                        "text": _truncate_text(msg["content"]),
                     }
                 ],
             }
@@ -576,9 +573,9 @@ def call_backend(history: List[Dict[str, str]]) -> str:
     if not messages or messages[-1]["role"] not in ("user", "system"):
         raise ValueError("Last message must be user or system for backend request.")
 
-    max_tokens = st.session_state.get("max_tokens", 256)
+    max_tokens = st.session_state.get("max_tokens", 192)
     if st.session_state.get("fast_mode", False):
-        max_tokens = min(max_tokens, 160)
+        max_tokens = min(max_tokens, 96)
 
     payload: Dict[str, Any] = {
         "model": "epsteingpt",
@@ -621,14 +618,11 @@ def call_backend(history: List[Dict[str, str]]) -> str:
         if text.startswith("Summary:"):
             summary = text
         elif text.startswith("Key points:"):
-            # Skip key points in the main chat display for now
             continue
         else:
-            # First non-summary, non-key-points text is treated as main answer
             if raw is None:
                 raw = text
 
-    # Fallback: if we didn't find a clear raw answer, join all text parts
     if raw is None:
         texts: List[str] = []
         for part in parts:
@@ -642,11 +636,9 @@ def call_backend(history: List[Dict[str, str]]) -> str:
 
     raw = raw.strip()
 
-    # --- Basic quality filters for obviously bad answers ---
-
     user_last = history[-1]["content"].strip().lower() if history else ""
 
-    # If the user asked "who ..." and the answer is tiny (e.g. "yes.")
+    # Guard: "who ..." + tiny answer
     if user_last.startswith("who ") and len(raw) < 20:
         return (
             "I’m not able to provide a reliable list of specific names from the Epstein "
@@ -654,11 +646,20 @@ def call_backend(history: List[Dict[str, str]]) -> str:
             "verified reporting for that question."
         )
 
-    # If the answer looks like a random transcript (speaker tags in all caps + colon)
-    if any(token.endswith(":") and token.isupper() for token in raw.split()):
+    # Softer transcript guard: only if it really looks like a big transcript blob
+    upper_tokens = [t for t in raw.split() if t.endswith(":") and t[:-1].isupper()]
+    if len(upper_tokens) >= 4 and len(raw) > 200:
         return (
             "The model drifted into unrelated transcript-like text instead of answering "
             "your question clearly. Please rephrase or narrow your question."
+        )
+
+    # Topic-specific guard for short Epstein answers
+    if "epstein" in user_last and "jeffrey" in user_last and len(raw) < 40:
+        return (
+            "Public knowledge about Jeffrey Epstein comes from extensive media reporting "
+            "and court records, but this local model is not an authoritative source. "
+            "Consult primary documents and reputable investigations for accurate details."
         )
 
     if summary:
@@ -670,14 +671,13 @@ def call_backend(history: List[Dict[str, str]]) -> str:
 # ---------- Chat UI ----------
 
 if "messages" not in st.session_state:
-    # Each message: {"role": "user" | "assistant" | "system", "content": str}
     st.session_state.messages: List[Dict[str, str]] = []
     st.markdown(
         "#### Welcome\n"
-        "_EpsteinGPT is an experimental, local‑first research assistant. Responses may be slow and should be independently verified._"
+        "_EpsteinGPT is an experimental, local‑first research assistant. "
+        "Responses may be slow and should be independently verified._"
     )
 
-# Render existing history
 for msg in st.session_state.messages:
     role = msg["role"]
     if role not in ("user", "assistant"):
@@ -686,18 +686,14 @@ for msg in st.session_state.messages:
     with st.chat_message(role, avatar=avatar):
         st.markdown(msg["content"])
 
-# Input from user
 user_text = st.chat_input("Ask EpsteinGPT anything about the public archives…")
 
 if user_text:
-    # Store user message
     st.session_state.messages.append({"role": "user", "content": user_text})
 
-    # Display user message immediately
     with st.chat_message("user", avatar="🧑‍💻"):
         st.markdown(user_text)
 
-    # Backend call + assistant rendering
     with st.chat_message("assistant", avatar="🧠"):
         with st.spinner("EpsteinGPT is thinking…"):
             start = time.time()
@@ -705,11 +701,9 @@ if user_text:
                 assistant_text = call_backend(st.session_state.messages)
                 elapsed = time.time() - start
 
-                # Streaming façade for better UX
                 placeholder = st.empty()
                 buffer = ""
                 words = assistant_text.split(" ")
-                # Speed up if answer is long
                 delay = 0.02 if len(words) < 120 else 0.0
 
                 for chunk in words:
@@ -719,12 +713,10 @@ if user_text:
                         time.sleep(delay)
                 placeholder.markdown(buffer)
 
-                # Persist in history
                 st.session_state.messages.append(
                     {"role": "assistant", "content": assistant_text}
                 )
 
-                # Latency + mode info
                 mode_label = "fast" if st.session_state.get("fast_mode", False) else "deep"
                 st.caption(
                     f"Response time: {elapsed:.2f} s · mode: {mode_label} · "
