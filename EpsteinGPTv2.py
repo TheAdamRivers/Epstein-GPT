@@ -15,6 +15,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 
@@ -22,6 +23,10 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     get_cosine_schedule_with_warmup,
+    CLIPProcessor,
+    CLIPModel,
+    WhisperProcessor,
+    WhisperModel,
 )
 
 import numpy as np
@@ -32,90 +37,90 @@ import PyPDF2
 import faiss
 from sentence_transformers import SentenceTransformer
 
-# New: API / multimodal imports
+import torchaudio
+import cv2
+
 from fastapi import FastAPI, Body, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 
-from transformers import CLIPProcessor, CLIPModel, WhisperProcessor, WhisperModel
-import torchaudio
-import cv2
-import torch.nn as nn
 
 # =========================================================
-# 0. Global Performance Tweaks
+# 1. Torch & CuDNN Tweaks
 # =========================================================
 
-torch.backends.cudnn.benchmark = torch.cuda.is_available()
+torch.backends.cudnn.benchmark = True
+
 
 # =========================================================
-# 1. Configuration
+# 2. Config
 # =========================================================
-
 
 class Config:
-    # Core model & training
-    base_model = "EleutherAI/gpt-neo-2.7B"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    data_path = "./epstein_files"
+    # Base model & device
+    base_model: str = "EleutherAI/gpt-neo-2.7B"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    max_len = 1024
-    stride = 256
-    batch_size = 2
-    epochs = 3
-    lr = 5e-5
-    warmup_ratio = 0.03
-    weight_decay = 0.01
-    max_grad_norm = 1.0
+    # Data / training hyperparams
+    data_path: str = "./epstein_files"
+    max_len: int = 1024
+    stride: int = 256
+    batch_size: int = 2
+    epochs: int = 3
+    lr: float = 5e-5
+    warmup_ratio: float = 0.03
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
 
-    # Epistemic loss
-    num_roots = 7
-    lambda_reg = 0.25
-    sigma_a = 0.1
-    sigma_h = 0.05
-    alpha_base = 2.5
-    rho_base = 2.0
-    total_steps_cap = 1_000_000
+    # Epistemic loss hyperparams
+    num_roots: int = 7
+    lambda_reg: float = 0.25
+    sigma_a: float = 0.1
+    sigma_h: float = 0.05
+    alpha_base: float = 2.5
+    rho_base: float = 2.0
+    total_steps_cap: int = 1_000_000
 
-    # Ingestion / crawl
-    ingestion_interval_sec = 1800
-    keywords = ["epstein", "declassified", "leak", "government", "files"]
-    max_new_docs_per_cycle = 10
-    public_archives = [
+    # Ingestion
+    ingestion_interval_sec: int = 1800
+    keywords: List[str] = ["epstein", "declassified", "leak", "government", "files"]
+    max_new_docs_per_cycle: int = 10
+    public_archives: List[str] = [
         "https://www.archives.gov/research/jfk",
         "https://www.justice.gov/oig/reports",
         "https://www.governmentattic.org",
     ]
 
-    # Semantic dedup
-    embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
-    dedup_index_path = "./dedup_index.faiss"
-    dedup_meta_path = "./dedup_meta.jsonl"
-    dedup_threshold = 0.90
+    # Dedup
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    dedup_index_path: str = "./dedup_index.faiss"
+    dedup_meta_path: str = "./dedup_meta.jsonl"
+    dedup_threshold: float = 0.90
 
-    # Checkpoints & metadata
-    checkpoint_dir = "./checkpoints"
-    checkpoint_every_steps = 500
-    metadata_store_path = "./metadata_store.json"
-    metadata_log_path = "./metadata_store.log.jsonl"
-    db_path = "./epsteingpt.db"
+    # Checkpoints & DB
+    checkpoint_dir: str = "./checkpoints"
+    checkpoint_every_steps: int = 500
+    metadata_store_path: str = "./metadata_store.json"
+    metadata_log_path: str = "./metadata_store.log.jsonl"
+    db_path: str = "./epsteingpt.db"
 
-    supervisor_interval_sec = 60
-    max_disk_usage_ratio = 0.9
-    max_checkpoints_to_keep = 10
-    faiss_ivf_threshold = 1_000_000  # future use
+    # Supervisor
+    supervisor_interval_sec: int = 60
+    max_disk_usage_ratio: float = 0.9
+    max_checkpoints_to_keep: int = 10
+    faiss_ivf_threshold: int = 1_000_000  # reserved for future use
 
-    # API / chat
-    api_host = "0.0.0.0"
-    api_port = 8000
-    enable_api = True
+    # API
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    enable_api: bool = True
 
-    # UI / API behaviour
-    enable_streaming: bool = False          # reserved for WebSockets
-    max_upload_mb: int = 64                 # backend media size limit
-    safe_mode_default: bool = False
+    # UI / API behavior
+    enable_streaming: bool = False  # reserved for WebSockets
+    max_upload_mb: int = 64
+    safemode_default: bool = False
 
-    # Media embedding cache
+    # Media cache
     media_cache_dir: str = "./media_cache"
     reuse_cached_embeddings: bool = True
 
@@ -123,30 +128,34 @@ class Config:
     max_summary_chars: int = 400
     max_summary_bullets: int = 5
 
+    # Chat fine-tune mode (optional)
+    chat_finetune_mode: bool = False  # when True, training uses CE on chat-style prompts
+
 
 CFG = Config()
 os.makedirs(CFG.data_path, exist_ok=True)
 os.makedirs(CFG.checkpoint_dir, exist_ok=True)
 os.makedirs(CFG.media_cache_dir, exist_ok=True)
 
+
 # =========================================================
-# 2. SQLite Persistence Layer
+# 3. DB & Logging
 # =========================================================
 
-_db_lock = threading.Lock()
-_db_conn: Optional[sqlite3.Connection] = None
+db_lock = threading.Lock()
+db_conn: Optional[sqlite3.Connection] = None
 
 
 def get_db() -> sqlite3.Connection:
-    global _db_conn
-    if _db_conn is None:
-        _db_conn = sqlite3.connect(CFG.db_path, check_same_thread=False)
-        _db_conn.row_factory = sqlite3.Row
-        with _db_conn:
-            _db_conn.execute("PRAGMA journal_mode=WAL;")
-            _db_conn.execute("PRAGMA synchronous=NORMAL;")
-            _db_conn.execute("PRAGMA foreign_keys=ON;")
-    return _db_conn
+    global db_conn
+    if db_conn is None:
+        db_conn = sqlite3.connect(CFG.db_path, check_same_thread=False)
+        db_conn.row_factory = sqlite3.Row
+        with db_conn:
+            db_conn.execute("PRAGMA journal_mode=WAL")
+            db_conn.execute("PRAGMA synchronous=NORMAL")
+            db_conn.execute("PRAGMA foreign_keys=ON")
+    return db_conn
 
 
 def init_db():
@@ -162,7 +171,7 @@ def init_db():
                 config_json TEXT NOT NULL,
                 last_step INTEGER DEFAULT 0,
                 last_ckpt_path TEXT
-            );
+            )
             """
         )
         conn.execute(
@@ -176,7 +185,7 @@ def init_db():
                 timestamp REAL NOT NULL,
                 PRIMARY KEY (run_id, step),
                 FOREIGN KEY (run_id) REFERENCES runs(id)
-            );
+            )
             """
         )
         conn.execute(
@@ -186,7 +195,7 @@ def init_db():
                 ingested_at REAL NOT NULL,
                 hash TEXT,
                 used_in_training INTEGER DEFAULT 0
-            );
+            )
             """
         )
         conn.execute(
@@ -196,31 +205,31 @@ def init_db():
                 level TEXT NOT NULL,
                 source TEXT NOT NULL,
                 message_json TEXT NOT NULL
-            );
+            )
             """
         )
 
 
-def log_event(level: str, source: str, message: Dict):
+def log_event(level: str, source: str, message: Dict[str, Any]):
     conn = get_db()
     payload = dict(message)
-    if "traceback" not in payload:
+    if "traceback" not in payload and level in ("ERROR", "WARN"):
         payload["traceback"] = traceback.format_exc()
-    with _db_lock, conn:
+    with db_lock, conn:
         conn.execute(
-            "INSERT INTO events(time, level, source, message_json) VALUES(?,?,?,?)",
+            "INSERT INTO events (time, level, source, message_json) VALUES (?, ?, ?, ?)",
             (time.time(), level, source, json.dumps(payload, ensure_ascii=False)),
         )
 
 
-def log_run_start(config: Dict) -> int:
+def log_run_start(config: Dict[str, Any]) -> int:
     conn = get_db()
-    with _db_lock, conn:
+    with db_lock, conn:
         cur = conn.execute(
-            "INSERT INTO runs(start_time, status, config_json) VALUES(?,?,?)",
+            "INSERT INTO runs (start_time, status, config_json) VALUES (?, ?, ?)",
             (time.time(), "running", json.dumps(config, ensure_ascii=False)),
         )
-    return cur.lastrowid
+        return cur.lastrowid
 
 
 def log_run_step(
@@ -232,10 +241,12 @@ def log_run_step(
     ckpt_path: Optional[str],
 ):
     conn = get_db()
-    with _db_lock, conn:
+    with db_lock, conn:
         conn.execute(
-            "INSERT OR REPLACE INTO steps(run_id, step, loss, ce, reg, timestamp) "
-            "VALUES(?,?,?,?,?,?)",
+            """
+            INSERT OR REPLACE INTO steps (run_id, step, loss, ce, reg, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
             (run_id, step, loss, ce, reg, time.time()),
         )
         conn.execute(
@@ -246,7 +257,7 @@ def log_run_step(
 
 def log_run_end(run_id: int, status: str):
     conn = get_db()
-    with _db_lock, conn:
+    with db_lock, conn:
         conn.execute(
             "UPDATE runs SET end_time = ?, status = ? WHERE id = ?",
             (time.time(), status, run_id),
@@ -255,66 +266,79 @@ def log_run_end(run_id: int, status: str):
 
 def get_last_good_checkpoint() -> Optional[Tuple[int, str]]:
     conn = get_db()
-    with _db_lock, conn:
+    with db_lock, conn:
         row = conn.execute(
-            "SELECT id, last_ckpt_path FROM runs "
-            "WHERE status='success' AND last_ckpt_path IS NOT NULL "
-            "ORDER BY end_time DESC LIMIT 1"
+            """
+            SELECT id, last_ckpt_path FROM runs
+            WHERE status = 'success' AND last_ckpt_path IS NOT NULL
+            ORDER BY end_time DESC LIMIT 1
+            """
         ).fetchone()
-    if row and row["last_ckpt_path"]:
-        return row["id"], row["last_ckpt_path"]
-    return None
+        if row and row["last_ckpt_path"]:
+            return row["id"], row["last_ckpt_path"]
+        return None
 
 
 def record_doc_ingested(path: Path, file_hash: str):
     conn = get_db()
-    with _db_lock, conn:
+    p = str(path.resolve())
+    with db_lock, conn:
         conn.execute(
-            "INSERT OR REPLACE INTO docs(path, ingested_at, hash, used_in_training) "
-            "VALUES(?,?,?,COALESCE((SELECT used_in_training FROM docs WHERE path=?),0))",
-            (str(path.resolve()), time.time(), file_hash, str(path.resolve())),
+            """
+            INSERT OR REPLACE INTO docs (path, ingested_at, hash, used_in_training)
+            VALUES (
+                ?, ?, ?, COALESCE((SELECT used_in_training FROM docs WHERE path=?), 0)
+            )
+            """,
+            (p, time.time(), file_hash, p),
         )
 
+
 # =========================================================
-# 3. Metadata Store (JSON + dict, batched + JSONL log)
+# 4. Metadata Store & Authority Heuristics
 # =========================================================
 
-_metadata_lock = threading.Lock()
-_metadata_store: Dict[str, Dict] = {}
-_metadata_buffer: List[Tuple[str, Dict]] = []
-_METADATA_BUFFER_FLUSH = 50
-_METADATA_SNAPSHOT_INTERVAL = 1000
+metadata_lock = threading.Lock()
+metadata_store: Dict[str, Dict[str, Any]] = {}
+metadata_buffer: List[Tuple[str, Dict[str, Any]]] = []
+METADATA_BUFFER_FLUSH = 50
+METADATA_SNAPSHOT_INTERVAL = 1000
 
 
 def load_metadata_store():
-    global _metadata_store
+    global metadata_store
     path = Path(CFG.metadata_store_path)
     if path.exists():
         try:
-            _metadata_store = json.loads(path.read_text(encoding="utf-8"))
+            metadata_store = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            _metadata_store = {}
+            metadata_store = {}
 
 
 def _flush_metadata_buffer():
-    global _metadata_buffer
-    if not _metadata_buffer:
+    global metadata_buffer
+    if not metadata_buffer:
         return
-    with _metadata_lock:
-        for key, meta in _metadata_buffer:
-            _metadata_store[key] = meta
+    with metadata_lock:
+        for key, meta in metadata_buffer:
+            metadata_store[key] = meta
         with open(CFG.metadata_log_path, "a", encoding="utf-8") as f:
-            for key, meta in _metadata_buffer:
-                f.write(json.dumps({"key": key, "meta": meta}, ensure_ascii=False) + "\n")
-        if len(_metadata_store) % _METADATA_SNAPSHOT_INTERVAL == 0:
+            for key, meta in metadata_buffer:
+                f.write(
+                    json.dumps(
+                        {"key": key, "meta": meta}, ensure_ascii=False
+                    )
+                    + "\n"
+                )
+        if len(metadata_store) % METADATA_SNAPSHOT_INTERVAL == 0:
             Path(CFG.metadata_store_path).write_text(
-                json.dumps(_metadata_store, ensure_ascii=False, indent=2),
+                json.dumps(metadata_store, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        _metadata_buffer = []
+        metadata_buffer = []
 
 
-def infer_doc_type_from_path(path: Path) -> str:
+def _infer_doc_type_from_path(path: Path) -> str:
     p = str(path).lower()
     if "gov" in p:
         return "gov"
@@ -325,8 +349,8 @@ def infer_doc_type_from_path(path: Path) -> str:
     return "unknown"
 
 
-def estimate_local_citation_count(text: str) -> int:
-    patterns = ["v.", "vs.", "case no.", "u.s.c.", "§", "[", "]"]
+def _estimate_local_citation_count(text: str) -> int:
+    patterns = ["v.", "vs.", "case no.", "u.s.c.", "§"]
     count = 0
     lower = text.lower()
     for pat in patterns:
@@ -334,57 +358,54 @@ def estimate_local_citation_count(text: str) -> int:
     return count
 
 
-def update_metadata_for_file(path: Path, text: str, source_url: str | None = None):
-    global _metadata_buffer
+def update_metadata_for_file(path: Path, text: str, source_url: Optional[str] = None):
+    global metadata_buffer
     key = str(path.resolve())
-    doc_type = infer_doc_type_from_path(path)
-    local_cites = estimate_local_citation_count(text)
+    doctype = _infer_doc_type_from_path(path)
+    local_cites = _estimate_local_citation_count(text)
     rank_score = 0.5
+
     meta = {
         "local_path": key,
         "source_url": source_url,
-        "doc_type": doc_type,
+        "doctype": doctype,
         "local_citation_count": local_cites,
         "rank_score": rank_score,
         "timestamp": time.time(),
     }
-    _metadata_buffer.append((key, meta))
-    if len(_metadata_buffer) >= _METADATA_BUFFER_FLUSH:
+    metadata_buffer.append((key, meta))
+    if len(metadata_buffer) >= METADATA_BUFFER_FLUSH:
         _flush_metadata_buffer()
 
 
-def compute_authority(source_metadata: Dict) -> float:
+def compute_authority(source_metadata: Dict[str, Any]) -> float:
     rank_score = float(source_metadata.get("rank_score", 0.0))
     local_cites = int(source_metadata.get("local_citation_count", 0))
-    doc_type = source_metadata.get("doc_type", "unknown")
+    doctype = source_metadata.get("doctype", "unknown")
     type_boost = {
         "gov": 1.0,
         "court": 0.8,
         "media": 0.4,
         "unknown": 0.0,
-    }.get(doc_type, 0.0)
-    authority = np.tanh(np.log1p(local_cites) + rank_score + type_boost)
+    }.get(doctype, 0.0)
+    authority = np.tanh(np.log1p(local_cites)) * rank_score * type_boost
     return float(np.clip(authority, 0.0, 0.99))
 
 
-def sample_source_metadatas(n: int) -> List[Dict]:
-    with _metadata_lock:
-        values = list(_metadata_store.values())
+def sample_source_metadatas(n: int) -> List[Dict[str, Any]]:
+    with metadata_lock:
+        values = list(metadata_store.values())
         if not values:
             return [
-                {
-                    "rank_score": 0.5 + float(np.random.rand()),
-                    "local_citation_count": int(np.random.randint(0, 10)),
-                    "doc_type": "unknown",
-                }
+                {"rank_score": 0.5, "local_citation_count": int(np.random.randint(0, 10)), "doctype": "unknown"}
                 for _ in range(n)
             ]
         return [values[np.random.randint(0, len(values))] for _ in range(n)]
 
-# =========================================================
-# 4. Utility: Stable Text Hash + Media Cache Helpers
-# =========================================================
 
+# =========================================================
+# 5. Text & Media Extraction
+# =========================================================
 
 def compute_text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -392,35 +413,6 @@ def compute_text_hash(text: str) -> str:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def media_cache_path(hash_hex: str, suffix: str) -> Path:
-    safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"
-    return Path(CFG.media_cache_dir) / f"{hash_hex}{safe_suffix}"
-
-
-def load_cached_embedding(hash_hex: str) -> Optional[np.ndarray]:
-    if not CFG.reuse_cached_embeddings:
-        return None
-    npy = media_cache_path(hash_hex, ".npy")
-    if not npy.exists():
-        return None
-    try:
-        return np.load(npy)
-    except Exception:
-        return None
-
-
-def save_cached_embedding(hash_hex: str, emb: np.ndarray) -> None:
-    try:
-        npy = media_cache_path(hash_hex, ".npy")
-        np.save(npy, emb.astype(np.float32))
-    except Exception as e:
-        log_event("WARN", "media_cache", {"msg": "save_failed", "hash": hash_hex, "error": str(e)})
-
-# =========================================================
-# 5. Multi-modal Extraction (core, text-centric)
-# =========================================================
 
 
 def extract_text_from_pdf(path: Path) -> str:
@@ -444,7 +436,7 @@ def extract_text_from_pdf(path: Path) -> str:
 
 def extract_text(path: Path) -> str:
     suffix = path.suffix.lower()
-    if suffix in [".txt", ".md"]:
+    if suffix in (".txt", ".md"):
         try:
             return path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -458,7 +450,7 @@ def extract_text(path: Path) -> str:
             return ""
     if suffix == ".pdf":
         return extract_text_from_pdf(path)
-    if suffix in [".png", ".jpg", ".jpeg", ".tiff", ".bmp"]:
+    if suffix in (".png", ".jpg", ".jpeg", ".tiff", ".bmp"):
         try:
             return pytesseract.image_to_string(Image.open(path))
         except Exception:
@@ -475,8 +467,9 @@ def load_corpus(folder_path: str) -> List[str]:
                 texts.append(t)
     return texts
 
+
 # =========================================================
-# 6. Semantic Dedup (Local, batched FAISS writes)
+# 6. Semantic Deduper (SentenceTransformers + FAISS)
 # =========================================================
 
 class SemanticDeduper:
@@ -487,21 +480,23 @@ class SemanticDeduper:
         self.meta_path = meta_path
         self.threshold = threshold
         self.lock = threading.Lock()
+
         if os.path.exists(index_path):
             self.index = faiss.read_index(index_path)
         else:
             self.index = faiss.IndexFlatIP(self.dim)
-        self.meta_f = open(self.meta_path, "a+", encoding="utf-8")
-        self.meta_f.seek(0, os.SEEK_END)
-        self._pending_adds = 0
-        self._flush_every = 50
 
-    def _embed(self, text: str) -> np.ndarray:
-        emb = self.model.encode([text], normalize_embeddings=True)[0]
-        return emb.astype("float32")
+        self.meta_f = open(self.meta_path, "a", encoding="utf-8")
+        self.meta_f.seek(0, os.SEEK_END)
+        self.pending_adds = 0
+        self.flush_every = 50
+
+    def embed(self, text: str) -> np.ndarray:
+        emb = self.model.encode(text, normalize_embeddings=True)[0]
+        return emb.astype(np.float32)
 
     def is_duplicate(self, text: str) -> bool:
-        emb = self._embed(text)
+        emb = self.embed(text)
         with self.lock:
             if self.index.ntotal == 0:
                 return False
@@ -509,24 +504,24 @@ class SemanticDeduper:
             sim = float(D[0][0])
             return sim >= self.threshold
 
-    def _flush_index_if_needed(self, force: bool = False):
+    def flush_index_if_needed(self, force: bool = False):
         with self.lock:
-            if force or self._pending_adds >= self._flush_every:
+            if force or self.pending_adds >= self.flush_every:
                 faiss.write_index(self.index, self.index_path)
-                self._pending_adds = 0
+                self.pending_adds = 0
 
-    def add(self, text: str, meta: Dict):
-        emb = self._embed(text)
+    def add(self, text: str, meta: Dict[str, Any]):
+        emb = self.embed(text)
         with self.lock:
             self.index.add(emb.reshape(1, -1))
             self.meta_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
             self.meta_f.flush()
-            self._pending_adds += 1
-            self._flush_index_if_needed(force=False)
+            self.pending_adds += 1
+            self.flush_index_if_needed(force=False)
 
     def close(self):
         try:
-            self._flush_index_if_needed(force=True)
+            self.flush_index_if_needed(force=True)
             if hasattr(self, "meta_f") and not self.meta_f.closed:
                 self.meta_f.close()
         except Exception:
@@ -534,16 +529,12 @@ class SemanticDeduper:
 
 
 DEDUP = SemanticDeduper(
-    CFG.embedding_model_name,
-    CFG.dedup_index_path,
-    CFG.dedup_meta_path,
-    CFG.dedup_threshold,
+    CFG.embedding_model_name, CFG.dedup_index_path, CFG.dedup_meta_path, CFG.dedup_threshold
 )
 
 # =========================================================
-# 7. Dataset & Streaming Dataset
+# 7. Dataset & Dataloaders
 # =========================================================
-
 
 def chunk_ids(token_ids: List[int], max_len: int, stride: int) -> List[List[int]]:
     chunks: List[List[int]] = []
@@ -583,20 +574,6 @@ class EpsteinDataset(Dataset):
         return enc["input_ids"].squeeze(0), enc["attention_mask"].squeeze(0)
 
 
-def build_dataloader(tokenizer):
-    texts = load_corpus(CFG.data_path)
-    dataset = EpsteinDataset(texts, tokenizer, CFG.max_len, CFG.stride)
-    num_workers = 0 if CFG.device == "cpu" else 2
-    pin_memory = CFG.device == "cuda"
-    return DataLoader(
-        dataset,
-        batch_size=CFG.batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-
-
 class StreamingEpsteinDataset(IterableDataset):
     def __init__(self, data_root: str, tokenizer, max_len: int, stride: int):
         super().__init__()
@@ -632,44 +609,56 @@ class StreamingEpsteinDataset(IterableDataset):
             log_event("ERROR", "streaming_dataset", {"msg": "iter_error", "error": str(e)})
 
 
+def build_dataloader(tokenizer) -> DataLoader:
+    texts = load_corpus(CFG.data_path)
+    dataset = EpsteinDataset(texts, tokenizer, CFG.max_len, CFG.stride)
+    num_workers = 0 if CFG.device == "cpu" else 2
+    pin_memory = CFG.device == "cuda"
+    return DataLoader(
+        dataset,
+        batch_size=CFG.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
 def build_streaming_dataloader(tokenizer) -> DataLoader:
     ds = StreamingEpsteinDataset(CFG.data_path, tokenizer, CFG.max_len, CFG.stride)
     num_workers = 0 if CFG.device == "cpu" else 2
     pin_memory = CFG.device == "cuda"
-    persistent_workers = num_workers > 0
     return DataLoader(
         ds,
         batch_size=CFG.batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
+        persistent_workers=(num_workers > 0),
     )
 
+
 # =========================================================
-# 8. Epistemic Functions
+# 8. Epistemic Loss
 # =========================================================
 
-
-def dag_information(root_probs, corr_matrix, modality_weights=None):
-    eps = 1e-8
+def dag_information(root_probs, corr_matrix, modality_weights=None, eps: float = 1e-8):
     p = root_probs.clamp(min=eps)
     if modality_weights is not None:
         p = p * modality_weights
     n = p.size(-1)
     simpson = (p ** 2).sum(dim=-1)
     mi_penalty = corr_matrix.sum(dim=(-2, -1)) / (n * n + eps)
-    eff_support = 1.0 / (simpson + mi_penalty + eps)
-    return (eff_support - 1.0) / (n - 1.0)
+    eff_support = 1.0 / (simpson + eps) - mi_penalty
+    return eff_support - 1.0 / (n - 1.0)
 
 
 def authority_online(A_prior, model_agreement, sigma_a=0.1, beta=3.0):
-    mu = torch.tanh(beta * (A_prior + model_agreement))
+    mu = torch.tanh(beta * (A_prior * model_agreement))
     dist = torch.distributions.Normal(mu, sigma_a)
     return dist.rsample()
 
 
 def provenance_online(root_probs, model_agreement, corr_matrix, sigma_h=0.05):
-    adjusted = root_probs + 0.5 * (model_agreement - 0.5)
+    adjusted = root_probs * (0.5 + (model_agreement - 0.5))
     adjusted = torch.clamp(adjusted, 1e-8, 1.0)
     adjusted = adjusted / adjusted.sum(dim=-1, keepdim=True)
     H_eff = dag_information(adjusted, corr_matrix)
@@ -677,18 +666,26 @@ def provenance_online(root_probs, model_agreement, corr_matrix, sigma_h=0.05):
 
 
 def imbalance(A, H, sigma_a, sigma_h):
-    kappa = torch.exp(-(sigma_a + sigma_h))
+    kappa = torch.exp(-sigma_a * sigma_h)
     return kappa * (A - H)
 
 
 def adaptive_reg(imb, step, total_steps=1_000_000, alpha_base=2.5, rho_base=2.0):
     decay = max(0.1, 1.0 - step / total_steps)
-    alpha = alpha_base * (1.0 + imb.abs()) * decay
-    rho = rho_base * (1.0 + 0.5 * imb.abs()) * decay
-    return (alpha * F.softplus(imb) ** rho).mean()
+    alpha = alpha_base * (1.0 + imb.abs() * decay)
+    rho = rho_base * (1.0 + 0.5 * imb.abs() * decay)
+    return alpha * F.softplus(imb) + rho.mean()
 
 
-def epistemic_loss(logits, labels, A_prior, root_probs, corr_matrix, model_agreement, step):
+def epistemic_loss(
+    logits,
+    labels,
+    A_prior,
+    root_probs,
+    corr_matrix,
+    model_agreement,
+    step,
+):
     labels = labels.clone()
     labels[labels == 0] = -100
     ce = F.cross_entropy(
@@ -697,9 +694,10 @@ def epistemic_loss(logits, labels, A_prior, root_probs, corr_matrix, model_agree
         ignore_index=-100,
         reduction="mean",
     )
+
     A_sample = authority_online(A_prior, model_agreement, sigma_a=CFG.sigma_a)
-    H_eff, sh = provenance_online(root_probs, model_agreement, corr_matrix, sigma_h=CFG.sigma_h)
-    imb = imbalance(A_sample, H_eff, CFG.sigma_a, sh)
+    H_eff, s_h = provenance_online(root_probs, model_agreement, corr_matrix, sigma_h=CFG.sigma_h)
+    imb = imbalance(A_sample, H_eff, CFG.sigma_a, s_h)
     reg = adaptive_reg(
         imb,
         step,
@@ -709,10 +707,10 @@ def epistemic_loss(logits, labels, A_prior, root_probs, corr_matrix, model_agree
     )
     return ce + CFG.lambda_reg * reg, ce, reg
 
-# =========================================================
-# 9. Model Loader
-# =========================================================
 
+# =========================================================
+# 9. Model Loading & Checkpoints
+# =========================================================
 
 def load_model_and_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(CFG.base_model)
@@ -738,17 +736,17 @@ def load_checkpoint_if_available(model) -> Optional[int]:
         return run_id
     return None
 
+
 # =========================================================
-# 10. Ingestion + Dedup + Metadata
+# 10. Ingestion (Fetch Open Source Docs + Dedup)
 # =========================================================
 
-
-def download_file(url: str, out_path: Path) -> bool:
+def download_file(url: str, outpath: Path) -> bool:
     try:
         r = requests.get(url, timeout=20)
         if r.status_code != 200:
             return False
-        with open(out_path, "wb") as f:
+        with open(outpath, "wb") as f:
             f.write(r.content)
         return True
     except Exception as e:
@@ -757,7 +755,7 @@ def download_file(url: str, out_path: Path) -> bool:
 
 
 def fetch_open_source_docs() -> List[Path]:
-    new_files: List[Path] = []
+    newfiles: List[Path] = []
     for archive in CFG.public_archives:
         try:
             resp = requests.get(archive, timeout=20)
@@ -776,26 +774,26 @@ def fetch_open_source_docs() -> List[Path]:
                 if not url.startswith("http"):
                     continue
                 fname = Path(href).name or "downloaded_file"
-                out_path = Path(CFG.data_path) / fname
-                if out_path.exists():
+                outpath = Path(CFG.data_path) / fname
+                if outpath.exists():
                     continue
-                if not download_file(url, out_path):
+                if not download_file(url, outpath):
                     continue
-                text = extract_text(out_path)
+                text = extract_text(outpath)
                 if not text.strip() or DEDUP.is_duplicate(text):
-                    out_path.unlink(missing_ok=True)
+                    outpath.unlink(missing_ok=True)
                     continue
-                update_metadata_for_file(out_path, text, source_url=url)
+                update_metadata_for_file(outpath, text, source_url=url)
                 meta = {
                     "source_url": url,
-                    "local_path": str(out_path),
+                    "local_path": str(outpath),
                     "timestamp": time.time(),
                 }
                 DEDUP.add(text, meta)
                 file_hash = compute_text_hash(text)
-                record_doc_ingested(out_path, file_hash)
-                new_files.append(out_path)
-                if len(new_files) >= CFG.max_new_docs_per_cycle:
+                record_doc_ingested(outpath, file_hash)
+                newfiles.append(outpath)
+                if len(newfiles) >= CFG.max_new_docs_per_cycle:
                     break
         except Exception as e:
             log_event(
@@ -805,23 +803,23 @@ def fetch_open_source_docs() -> List[Path]:
             )
             continue
     _flush_metadata_buffer()
-    return new_files
+    return newfiles
 
 
 def continuous_ingestion_loop():
     while True:
         try:
-            new_docs = fetch_open_source_docs()
-            if new_docs:
-                print(f"[Ingestion] Downloaded {len(new_docs)} new (non-duplicate) documents.")
+            newdocs = fetch_open_source_docs()
+            if newdocs:
+                print(f"[Ingestion] Downloaded {len(newdocs)} new non-duplicate documents.")
         except Exception as e:
             log_event("ERROR", "ingestion", {"msg": "ingestion_loop_error", "error": str(e)})
         time.sleep(CFG.ingestion_interval_sec)
 
+
 # =========================================================
 # 11. Training Managers (plain + AMP)
 # =========================================================
-
 
 class TrainingManager:
     def __init__(self, model, tokenizer, run_id: Optional[int] = None):
@@ -866,17 +864,17 @@ class TrainingManager:
         dataloader = build_dataloader(self.tokenizer)
         if len(dataloader) == 0:
             return
+
         total_steps = len(dataloader) * CFG.epochs
         optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=CFG.lr,
-            weight_decay=CFG.weight_decay,
+            self.model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay
         )
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             int(total_steps * CFG.warmup_ratio),
             total_steps,
         )
+
         try:
             for epoch in range(CFG.epochs):
                 for input_ids, attention_mask in dataloader:
@@ -894,6 +892,7 @@ class TrainingManager:
                         )
                         logits = outputs.logits
                         batch_size, seq_len = input_ids.shape
+
                         _ = sample_source_metadatas(CFG.num_roots)
                         A_prior = torch.rand(batch_size, seq_len, device=CFG.device)
                         root_probs = torch.rand(
@@ -905,6 +904,7 @@ class TrainingManager:
                             .repeat(batch_size, 1, 1)
                         )
                         model_agreement = torch.rand(batch_size, seq_len, device=CFG.device)
+
                         loss, ce_loss, reg_loss = epistemic_loss(
                             logits,
                             input_ids,
@@ -914,12 +914,14 @@ class TrainingManager:
                             model_agreement,
                             self.global_step,
                         )
+
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), CFG.max_grad_norm)
                         optimizer.step()
                         scheduler.step()
                         self.global_step += 1
+
                         if self.global_step % 50 == 0:
                             print(
                                 f"[Train] Epoch {epoch} Step {self.global_step}/{total_steps} "
@@ -982,6 +984,7 @@ class TrainingManagerAMP:
     def train_streaming_epoch(self):
         self._ensure_run()
         dataloader = build_streaming_dataloader(self.tokenizer)
+
         optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay
         )
@@ -991,11 +994,13 @@ class TrainingManagerAMP:
             int(total_steps_est * CFG.warmup_ratio),
             total_steps_est,
         )
+
         try:
             for input_ids, attention_mask in dataloader:
                 if self.stop_flag:
                     log_run_end(self.run_id, "interrupted")
                     return
+
                 with self.training_lock:
                     self.model.train()
                     input_ids = input_ids.to(
@@ -1004,6 +1009,7 @@ class TrainingManagerAMP:
                     attention_mask = attention_mask.to(
                         CFG.device, non_blocking=(CFG.device == "cuda")
                     )
+
                     amp_ctx = torch.cuda.amp.autocast(enabled=self.amp_enabled)
                     with amp_ctx:
                         outputs = self.model(
@@ -1013,55 +1019,73 @@ class TrainingManagerAMP:
                         )
                         logits = outputs.logits
                         batch_size, seq_len = input_ids.shape
-                        _ = sample_source_metadatas(CFG.num_roots)
-                        A_prior_seq = torch.rand(seq_len, device=CFG.device)
-                        root_probs_seq = torch.rand(seq_len, CFG.num_roots, device=CFG.device)
-                        corr_matrix_seq = torch.eye(CFG.num_roots, device=CFG.device)
-                        A_prior = A_prior_seq.unsqueeze(0).expand(batch_size, -1)
-                        root_probs = root_probs_seq.unsqueeze(0).expand(batch_size, -1, -1)
-                        corr_matrix = corr_matrix_seq.unsqueeze(0).expand(batch_size, -1, -1)
-                        model_agreement = torch.rand(batch_size, seq_len, device=CFG.device)
-                        loss, ce_loss, reg_loss = epistemic_loss(
-                            logits,
-                            input_ids,
-                            A_prior,
-                            root_probs,
-                            corr_matrix,
-                            model_agreement,
-                            self.global_step,
-                        )
-                    optimizer.zero_grad(set_to_none=True)
-                    if self.amp_enabled:
-                        try:
-                            self.scaler.scale(loss).backward()
-                            self.scaler.unscale_(optimizer)
+
+                        if CFG.chat_finetune_mode:
+                            # Plain CE loss on next-token prediction for chat fine-tune
+                            labels = input_ids.clone()
+                            labels[labels == 0] = -100
+                            loss = F.cross_entropy(
+                                logits.view(-1, logits.size(-1)),
+                                labels.view(-1),
+                                ignore_index=-100,
+                                reduction="mean",
+                            )
+                            ce_loss = loss
+                            reg_loss = torch.tensor(0.0, device=CFG.device)
+                        else:
+                            _ = sample_source_metadatas(CFG.num_roots)
+                            A_prior_seq = torch.rand(seq_len, device=CFG.device)
+                            root_probs_seq = torch.rand(seq_len, CFG.num_roots, device=CFG.device)
+                            corr_matrix_seq = torch.eye(CFG.num_roots, device=CFG.device)
+                            A_prior = A_prior_seq.unsqueeze(0).expand(batch_size, -1)
+                            root_probs = root_probs_seq.unsqueeze(0).expand(batch_size, -1, -1)
+                            corr_matrix = corr_matrix_seq.unsqueeze(0).expand(batch_size, -1, -1)
+                            model_agreement = torch.rand(batch_size, seq_len, device=CFG.device)
+
+                            loss, ce_loss, reg_loss = epistemic_loss(
+                                logits,
+                                input_ids,
+                                A_prior,
+                                root_probs,
+                                corr_matrix,
+                                model_agreement,
+                                self.global_step,
+                            )
+
+                        optimizer.zero_grad(set_to_none=True)
+
+                        if self.amp_enabled:
+                            try:
+                                self.scaler.scale(loss).backward()
+                                self.scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(), CFG.max_grad_norm
+                                )
+                                self.scaler.step(optimizer)
+                                self.scaler.update()
+                            except RuntimeError as e:
+                                log_event(
+                                    "ERROR",
+                                    "training_amp",
+                                    {"msg": "amp_step_failed", "error": str(e)},
+                                )
+                                optimizer.zero_grad(set_to_none=True)
+                        else:
+                            loss.backward()
                             torch.nn.utils.clip_grad_norm_(
                                 self.model.parameters(), CFG.max_grad_norm
                             )
-                            self.scaler.step(optimizer)
-                            self.scaler.update()
-                        except RuntimeError as e:
-                            log_event(
-                                "ERROR",
-                                "training_amp",
-                                {"msg": "amp_step_failed", "error": str(e)},
+                            optimizer.step()
+                        scheduler.step()
+                        self.global_step += 1
+
+                        if self.global_step % 50 == 0:
+                            print(
+                                f"[Train-AMP] Step {self.global_step} "
+                                f"Loss={loss.item():.4f} CE={ce_loss.item():.4f} Reg={reg_loss.item():.4f}"
                             )
-                            optimizer.zero_grad(set_to_none=True)
-                    else:
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), CFG.max_grad_norm
-                        )
-                        optimizer.step()
-                    scheduler.step()
-                    self.global_step += 1
-                    if self.global_step % 50 == 0:
-                        print(
-                            f"[Train-AMP] Step {self.global_step} "
-                            f"Loss={loss.item():.4f} CE={ce_loss.item():.4f} Reg={reg_loss.item():.4f}"
-                        )
-                    if self.global_step % CFG.checkpoint_every_steps == 0:
-                        self._save_checkpoint(loss.item(), ce_loss.item(), reg_loss.item())
+                        if self.global_step % CFG.checkpoint_every_steps == 0:
+                            self._save_checkpoint(loss.item(), ce_loss.item(), reg_loss.item())
             log_run_end(self.run_id, "success")
         except Exception as e:
             log_event(
@@ -1077,23 +1101,23 @@ class TrainingManagerAMP:
             self.train_streaming_epoch()
             time.sleep(60)
 
+
 # =========================================================
 # 12. Supervisor
 # =========================================================
 
-
 class Supervisor:
-    def __init__(self, trainer):
+    def __init__(self, trainer: TrainingManagerAMP):
         self.trainer = trainer
         self.stop_flag = False
 
     def _get_latest_loss(self) -> Optional[float]:
         conn = get_db()
-        with _db_lock, conn:
+        with db_lock, conn:
             row = conn.execute(
                 "SELECT loss FROM steps ORDER BY timestamp DESC LIMIT 1"
             ).fetchone()
-        return row["loss"] if row else None
+            return row["loss"] if row else None
 
     def _check_disk_usage(self):
         total, used, free = shutil.disk_usage(".")
@@ -1131,23 +1155,18 @@ class Supervisor:
             try:
                 loss = self._get_latest_loss()
                 if loss is not None:
-                    print(f"[Supervisor] Latest loss: {loss:.4f}")
+                    print(f"[Supervisor] Latest loss {loss:.4f}")
                 self._check_disk_usage()
                 self._check_gpu_memory()
                 if CFG.device == "cuda":
                     torch.cuda.empty_cache()
             except Exception as e:
-                log_event(
-                    "ERROR",
-                    "supervisor",
-                    {"msg": "supervisor_error", "error": str(e)},
-                )
+                log_event("ERROR", "supervisor", {"msg": "supervisor_error", "error": str(e)})
             time.sleep(CFG.supervisor_interval_sec)
 
 # =========================================================
-# 13. Multimodal Encoders + Safe/Cached Wrappers
+# 13. Multimodal Encoders & Prefix
 # =========================================================
-
 
 class ImageEncoder:
     def __init__(self, device: str):
@@ -1163,7 +1182,7 @@ class ImageEncoder:
     def encode_pil(self, img: Image.Image) -> np.ndarray:
         inputs = self.processor(images=img, return_tensors="pt").to(self.device)
         with torch.inference_mode():
-            emb = self.model.get_image_features(**inputs)  # [1, d]
+            emb = self.model.get_image_features(**inputs)
             emb = F.normalize(emb, dim=-1)
         return emb.cpu().numpy().squeeze()
 
@@ -1176,10 +1195,6 @@ class AudioEncoder:
         self.model.eval()
 
     def encode_path(self, path: Path) -> Tuple[np.ndarray, str]:
-        """
-        Returns (embedding, transcript_text).
-        Embedding is mean-pooled encoder hidden state.
-        """
         waveform, sr = torchaudio.load(str(path))
         if waveform.ndim == 2 and waveform.size(0) > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
@@ -1193,13 +1208,12 @@ class AudioEncoder:
         with torch.inference_mode():
             enc_out = self.model.encoder(input_features)
             emb = enc_out.last_hidden_state.mean(dim=1)
-            emb = F.normalize(emb, dim=-1).cpu().numpy().squeeze()
-        with torch.inference_mode():
+            emb = F.normalize(emb, dim=-1)
             generated_ids = self.model.generate(input_features)
             transcript = self.processor.batch_decode(
                 generated_ids, skip_special_tokens=True
             )[0]
-        return emb, transcript
+        return emb.cpu().numpy().squeeze(), transcript
 
 
 class VideoEncoder:
@@ -1207,17 +1221,12 @@ class VideoEncoder:
         self.image_encoder = image_encoder
 
     def encode_path(self, path: Path) -> np.ndarray:
-        """
-        Sample ~1 frame every ~3 seconds and average CLIP embeddings.
-        """
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
-            return np.zeros(
-                self.image_encoder.model.config.projection_dim, dtype="float32"
-            )
+            return np.zeros(self.image_encoder.model.config.projection_dim, dtype=np.float32)
         fps = cap.get(cv2.CAP_PROP_FPS)
-        fps_int = max(int(fps) if fps > 0 else 1, 1)
-        frame_interval = max(int(fps_int * 3), 1)  # ~1 frame / 3s
+        fps = int(fps) if fps > 0 else 1
+        frame_interval = max(int(fps * 3), 1)  # sample 1 frame every ~3s
         embeddings: List[np.ndarray] = []
         idx = 0
         try:
@@ -1233,8 +1242,8 @@ class VideoEncoder:
         finally:
             cap.release()
         if embeddings:
-            return np.mean(np.stack(embeddings, axis=0), axis=0).astype("float32")
-        return np.zeros(self.image_encoder.model.config.projection_dim, dtype="float32")
+            return np.mean(np.stack(embeddings, axis=0), axis=0).astype(np.float32)
+        return np.zeros(self.image_encoder.model.config.projection_dim, dtype=np.float32)
 
 
 class MultimodalPrefix(nn.Module):
@@ -1248,6 +1257,7 @@ class MultimodalPrefix(nn.Module):
         self.img_proj = nn.Linear(image_dim, self.model_embed_dim)
         self.audio_proj = nn.Linear(audio_dim, self.model_embed_dim)
         self.video_proj = nn.Linear(video_dim, self.model_embed_dim)
+
         nn.init.xavier_uniform_(self.img_proj.weight)
         nn.init.xavier_uniform_(self.audio_proj.weight)
         nn.init.xavier_uniform_(self.video_proj.weight)
@@ -1260,11 +1270,12 @@ class MultimodalPrefix(nn.Module):
         video_emb: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         """
-        token_embs: [1, T, H]
-        Returns: token_embs with a single fused prefix added to all positions.
+        token_embs: (1, T, H)
+        Returns token_embs with a single fused prefix added to all positions.
         """
         device = token_embs.device
         prefix_vec = torch.zeros(self.model_embed_dim, device=device)
+
         if img_emb is not None:
             img_t = torch.tensor(img_emb, device=device, dtype=torch.float32)
             prefix_vec = prefix_vec + self.img_proj(img_t)
@@ -1274,15 +1285,12 @@ class MultimodalPrefix(nn.Module):
         if video_emb is not None:
             video_t = torch.tensor(video_emb, device=device, dtype=torch.float32)
             prefix_vec = prefix_vec + self.video_proj(video_t)
+
         if prefix_vec.abs().sum() == 0:
             return token_embs
-        prefix_vec = prefix_vec.unsqueeze(0).unsqueeze(1)  # [1,1,H]
+
+        prefix_vec = prefix_vec.unsqueeze(0).unsqueeze(1)  # (1, 1, H)
         return token_embs + prefix_vec
-
-
-def multimodal_condition_to_prefix(embs: List[np.ndarray]) -> str:
-    # Now handled in embedding space via MultimodalPrefix; no text marker needed.
-    return ""
 
 
 IMAGE_ENCODER: Optional[ImageEncoder] = None
@@ -1291,17 +1299,29 @@ VIDEO_ENCODER: Optional[VideoEncoder] = None
 MM_PREFIX: Optional[MultimodalPrefix] = None
 
 
-def init_multimodal_components(model):
-    global IMAGE_ENCODER, AUDIO_ENCODER, VIDEO_ENCODER, MM_PREFIX
-    IMAGE_ENCODER = ImageEncoder(CFG.device)
-    AUDIO_ENCODER = AudioEncoder(CFG.device)
-    VIDEO_ENCODER = VideoEncoder(IMAGE_ENCODER)
-    MM_PREFIX = MultimodalPrefix(model).to(CFG.device)
-    MM_PREFIX.eval()
+def media_cache_path(hash_hex: str, suffix: str) -> Path:
+    safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    return Path(CFG.media_cache_dir) / f"{hash_hex}{safe_suffix}"
 
-# =========================================================
-# 13b. Safe / Cached Media Encoders (bytes-level)
-# =========================================================
+
+def load_cached_embedding(hash_hex: str) -> Optional[np.ndarray]:
+    if not CFG.reuse_cached_embeddings:
+        return None
+    npy = media_cache_path(hash_hex, ".npy")
+    if not npy.exists():
+        return None
+    try:
+        return np.load(npy)
+    except Exception:
+        return None
+
+
+def save_cached_embedding(hash_hex: str, emb: np.ndarray) -> None:
+    try:
+        npy = media_cache_path(hash_hex, ".npy")
+        np.save(npy, emb.astype(np.float32))
+    except Exception as e:
+        log_event("WARN", "media_cache", {"msg": "save_failed", "hash": hash_hex, "error": str(e)})
 
 
 def safe_encode_image_bytes(data: bytes) -> Optional[np.ndarray]:
@@ -1334,8 +1354,8 @@ def safe_encode_audio_bytes(data: bytes) -> Tuple[Optional[np.ndarray], Optional
             tmp.write_bytes(data)
         if emb is None and AUDIO_ENCODER is not None:
             emb, transcript = AUDIO_ENCODER.encode_path(tmp)
-            if emb is not None:
-                save_cached_embedding(h, emb)
+        if emb is not None:
+            save_cached_embedding(h, emb)
         return emb, transcript
     except Exception as e:
         log_event("WARN", "audio_encoder", {"msg": "encode_failed", "error": str(e)})
@@ -1359,122 +1379,50 @@ def safe_encode_video_bytes(data: bytes) -> Optional[np.ndarray]:
         log_event("WARN", "video_encoder", {"msg": "encode_failed", "error": str(e)})
         return None
 
+
+def init_multimodal_components(model):
+    global IMAGE_ENCODER, AUDIO_ENCODER, VIDEO_ENCODER, MM_PREFIX
+    IMAGE_ENCODER = ImageEncoder(CFG.device)
+    AUDIO_ENCODER = AudioEncoder(CFG.device)
+    VIDEO_ENCODER = VideoEncoder(IMAGE_ENCODER)
+    MM_PREFIX = MultimodalPrefix(model).to(CFG.device)
+    MM_PREFIX.eval()
+
+
 # =========================================================
-# 14. Interactive Chat with Commands (local REPL)
+# 14. Post-processing of Answers
 # =========================================================
 
+def postprocess_answer(raw: str, simplify: bool = False) -> Dict[str, Any]:
+    text = raw.strip()
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    summary_src = paragraphs[0] if paragraphs else text
+    summary = summary_src[: CFG.max_summary_chars]
 
-def print_status():
-    conn = get_db()
-    with _db_lock, conn:
-        run = conn.execute(
-            "SELECT * FROM runs ORDER BY start_time DESC LIMIT 1"
-        ).fetchone()
-        step = conn.execute(
-            "SELECT * FROM steps ORDER BY timestamp DESC LIMIT 1"
-        ).fetchone()
-        docs_count = conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()["c"]
-    print("=== STATUS ===")
-    if run:
-        print(
-            f"Last run id: {run['id']} status={run['status']} "
-            f"last_step={run['last_step']}"
-        )
-    else:
-        print("No runs recorded.")
-    if step:
-        print(
-            f"Last step: {step['step']} loss={step['loss']:.4f} "
-            f"ce={step['ce']:.4f} reg={step['reg']:.4f}"
-        )
-    else:
-        print("No steps recorded.")
-    print(f"Documents ingested: {docs_count}")
-
-
-def print_runs(limit: int = 5):
-    conn = get_db()
-    with _db_lock, conn:
-        rows = conn.execute(
-            "SELECT * FROM runs ORDER BY start_time DESC LIMIT ?", (limit,)
-        ).fetchall()
-    print("=== RUNS ===")
-    for r in rows:
-        print(
-            f"id={r['id']} status={r['status']} last_step={r['last_step']} "
-            f"start={time.ctime(r['start_time'])} "
-            f"end={time.ctime(r['end_time']) if r['end_time'] else 'N/A'}"
-        )
-
-
-def print_help():
-    print("Commands:")
-    print(" /status - show last run, last step, docs count")
-    print(" /runs   - list recent runs")
-    print(" /pause  - pause training")
-    print(" /resume - resume training (new thread)")
-    print(" /help   - show this help")
-    print("Any other text is sent as a prompt to EpsteinGPT.")
-
-
-def epsteingpt_interact(model, tokenizer, trainer):
-    print("EpsteinGPT ready. Type '/help' for commands, 'exit' to quit.")
-    while True:
-        try:
-            line = input(">> ")
-        except EOFError:
+    bullets: List[str] = []
+    for p in paragraphs:
+        if len(bullets) >= CFG.max_summary_bullets:
             break
-        cmd = line.strip()
-        if cmd.lower() in {"exit", "quit"}:
-            trainer.stop_flag = True
-            break
-        if cmd.startswith("/"):
-            if cmd == "/status":
-                print_status()
-            elif cmd == "/runs":
-                print_runs()
-            elif cmd == "/pause":
-                trainer.stop_flag = True
-                print("[REPL] Training pause requested.")
-            elif cmd == "/resume":
-                if not trainer.stop_flag:
-                    print("[REPL] Training already running.")
-                else:
-                    trainer.stop_flag = False
-                    threading.Thread(
-                        target=trainer.training_loop, daemon=True
-                    ).start()
-                    print("[REPL] Training resumed in new thread.")
-            elif cmd == "/help":
-                print_help()
-            else:
-                print("[REPL] Unknown command. Use /help.")
+        line = p.replace("\n", " ").strip()
+        if not line:
             continue
+        bullets.append(f"- {line[:240]}")
 
-        with trainer.training_lock:
-            model.eval()
-            with torch.inference_mode():
-                inputs = tokenizer(cmd, return_tensors="pt").to(CFG.device)
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(answer)
+    out: Dict[str, Any] = {
+        "raw": text,
+        "summary": summary,
+        "bullets": bullets,
+    }
+    return out
+
 
 # =========================================================
-# 15. Chat API Schemas + Post-processing
+# 15. Pydantic Models for Chat API
 # =========================================================
-
 
 class ChatImageURL(BaseModel):
     url: str
-    detail: Optional[str] = None  # "low" | "high" etc.
+    detail: Optional[str] = None  # "low", "high", etc.
 
 
 class ChatAudioURL(BaseModel):
@@ -1502,9 +1450,9 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
     temperature: float = 0.7
-    top_p: float = 0.9
-    max_tokens: int = 256
-    stream: bool = False  # reserved for future streaming
+    top_p: float = Field(0.9, alias="top_p")
+    max_tokens: int = Field(256, alias="max_tokens")
+    stream: bool = False
 
 
 class ChatResponseChoice(BaseModel):
@@ -1521,37 +1469,9 @@ class ChatResponse(BaseModel):
     choices: List[ChatResponseChoice]
 
 
-def postprocess_answer(raw: str, simplify: bool = False) -> Dict[str, Any]:
-    text = raw.strip()
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    summary_src = paragraphs[0] if paragraphs else text
-    summary = summary_src[: CFG.max_summary_chars]
-
-    bullets: List[str] = []
-    for p in paragraphs:
-        if len(bullets) >= CFG.max_summary_bullets:
-            break
-        line = p.replace("\n", " ").strip()
-        if not line:
-            continue
-        bullets.append(f"- {line[:240]}")
-
-    out: Dict[str, Any] = {
-        "raw": text,
-        "summary": summary,
-        "bullets": bullets,
-    }
-
-    if simplify:
-        # Reserved for a second-pass "simplify" call if desired.
-        pass
-
-    return out
-
 # =========================================================
-# 16. ChatEngine (OpenAI-style) with Multimodal Conditioning
+# 16. Chat Engine (OpenAI-style Chat API)
 # =========================================================
-
 
 class ChatEngine:
     """
@@ -1574,7 +1494,7 @@ class ChatEngine:
         img_emb = None
         audio_emb = None
         video_emb = None
-        debug = {
+        debug: Dict[str, Any] = {
             "image_encoded": False,
             "audio_encoded": False,
             "video_encoded": False,
@@ -1656,15 +1576,66 @@ class ChatEngine:
         parts = [p.text for p in msg.content if p.type == "text" and p.text]
         return "\n".join(parts).strip()
 
+    def _classify_question_type(self, last_user_text: str) -> str:
+        q = last_user_text.strip().lower()
+        if not q:
+            return "chat"
+        if q.startswith(("who ", "what ", "when ", "where ", "why ", "how ")):
+            return "qa"
+        if any(kw in q for kw in ["summarize", "summary", "tl;dr"]):
+            return "summary"
+        if "explain like i'm" in q or "explain like im" in q:
+            return "explain_simple"
+        return "chat"
+
     def _build_prompt(self, history: List[ChatMessage], newmsg: ChatMessage) -> str:
+        """
+        Builds a dialogue-style prompt with a stronger task hint based on the last user turn.
+        """
         lines: List[str] = []
+
+        # Find last user text
+        last_user_text = ""
+        for m in reversed(history + [newmsg]):
+            if m.role == "user":
+                last_user_text = self._flatten_message_text(m)
+                break
+
+        qtype = self._classify_question_type(last_user_text)
+
+        if qtype == "summary":
+            task_hint = (
+                "Task: Summarize the user's content in 3–5 concise bullet points, "
+                "capturing the most important facts.\n"
+            )
+        elif qtype == "explain_simple":
+            task_hint = (
+                "Task: Explain the topic in simple language for a non-expert, "
+                "using 2–4 short paragraphs and one concrete example.\n"
+            )
+        elif qtype == "qa":
+            task_hint = (
+                "Task: Answer the user's question clearly in 2–3 paragraphs. "
+                "Include key context, relevant dates or roles if known, and briefly note "
+                "uncertainty or limitations instead of answering with a single word.\n"
+            )
+        else:
+            task_hint = (
+                "Task: Have a helpful, concise conversation. Use 1–3 paragraphs and avoid "
+                "one-word replies except for yes/no questions.\n"
+            )
+
+        lines.append(task_hint)
+
         for m in history:
             txt = self._flatten_message_text(m)
             if txt:
                 lines.append(f"{m.role.upper()}: {txt}")
+
         newtxt = self._flatten_message_text(newmsg)
         if newtxt:
             lines.append(f"{newmsg.role.upper()}: {newtxt}")
+
         lines.append("ASSISTANT:")
         return "\n".join(lines)
 
@@ -1680,6 +1651,7 @@ class ChatEngine:
 
         history_messages = req.messages[:-1]
         newmsg = req.messages[-1]
+
         if newmsg.role not in ("user", "system"):
             raise HTTPException(
                 status_code=400,
@@ -1717,6 +1689,7 @@ class ChatEngine:
                         top_p=req.top_p,
                         pad_token_id=self.tokenizer.pad_token_id,
                         eos_token_id=self.tokenizer.eos_token_id,
+                        use_cache=True,
                     )
                 else:
                     outputs = self.model.generate(
@@ -1727,20 +1700,22 @@ class ChatEngine:
                         top_p=req.top_p,
                         pad_token_id=self.tokenizer.pad_token_id,
                         eos_token_id=self.tokenizer.eos_token_id,
+                        use_cache=True,
                     )
 
-                full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                reply_text = self._extract_assistant_reply(full_text)
-
+        full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        reply_text = self._extract_assistant_reply(full_text)
         processed = postprocess_answer(reply_text)
 
         content_parts: List[Dict[str, Any]] = [
             {"type": "text", "text": reply_text},
         ]
+
         if processed["summary"]:
             content_parts.append(
                 {"type": "text", "text": "Summary:\n" + processed["summary"]}
             )
+
         if processed["bullets"]:
             content_parts.append(
                 {
@@ -1791,6 +1766,7 @@ class ChatEngine:
         )
         return resp
 
+
 # =========================================================
 # 17. FastAPI App + Initialization
 # =========================================================
@@ -1806,45 +1782,152 @@ def chat_completions(req: ChatRequest = Body(...), session_id: str = "default"):
         raise HTTPException(status_code=500, detail="ChatEngine not initialized")
     return chat_engine.chat(req, session_id=session_id)
 
+
 # =========================================================
-# 18. Main Entrypoint
+# 18. Local REPL (Optional)
 # =========================================================
 
+def print_status():
+    conn = get_db()
+    with db_lock, conn:
+        run = conn.execute(
+            "SELECT * FROM runs ORDER BY start_time DESC LIMIT 1"
+        ).fetchone()
+        step = conn.execute(
+            "SELECT * FROM steps ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        docs_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM docs"
+        ).fetchone()["c"]
+
+    print("=== STATUS ===")
+    if run:
+        print(
+            f"Last run id={run['id']} status={run['status']} last_step={run['last_step']}"
+        )
+    else:
+        print("No runs recorded.")
+    if step:
+        print(
+            f"Last step step={step['step']} loss={step['loss']:.4f} "
+            f"ce={step['ce']:.4f} reg={step['reg']:.4f}"
+        )
+    else:
+        print("No steps recorded.")
+    print(f"Documents ingested: {docs_count}")
+
+
+def print_runs(limit: int = 5):
+    conn = get_db()
+    with db_lock, conn:
+        rows = conn.execute(
+            "SELECT * FROM runs ORDER BY start_time DESC LIMIT ?", (limit,)
+        ).fetchall()
+    print("=== RUNS ===")
+    for r in rows:
+        print(
+            f"id={r['id']} status={r['status']} last_step={r['last_step']} "
+            f"start={time.ctime(r['start_time'])} "
+            f"end={time.ctime(r['end_time']) if r['end_time'] else 'NA'}"
+        )
+
+
+def print_help():
+    print("Commands:")
+    print("  status  - show last run, last step, docs count")
+    print("  runs    - list recent runs")
+    print("  pause   - pause training")
+    print("  resume  - resume training in a new thread")
+    print("  help    - show this help")
+    print("Any other text is sent as a prompt to EpsteinGPT.")
+
+
+def epsteingpt_interact(model, tokenizer, trainer: TrainingManagerAMP):
+    print("EpsteinGPT ready. Type 'help' for commands, 'exit' to quit.")
+    while True:
+        try:
+            line = input("> ")
+        except EOFError:
+            break
+        cmd = line.strip()
+        if cmd.lower() in ("exit", "quit"):
+            trainer.stop_flag = True
+            break
+        if cmd == "status":
+            print_status()
+            continue
+        if cmd == "runs":
+            print_runs()
+            continue
+        if cmd == "pause":
+            trainer.stop_flag = True
+            print("[REPL] Training pause requested.")
+            continue
+        if cmd == "resume":
+            if not trainer.stop_flag:
+                print("[REPL] Training already running.")
+            else:
+                trainer.stop_flag = False
+                threading.Thread(target=trainer.training_loop, daemon=True).start()
+                print("[REPL] Training resumed in new thread.")
+            continue
+        if cmd == "help":
+            print_help()
+            continue
+
+        with trainer.training_lock:
+            model.eval()
+            with torch.inference_mode():
+                inputs = tokenizer(cmd, return_tensors="pt").to(CFG.device)
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+                answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(answer)
+
+
+# =========================================================
+# 19. Main Entrypoint
+# =========================================================
 
 def main():
     init_db()
     load_metadata_store()
 
-    # Start ingestion thread
-    threading.Thread(target=continuous_ingestion_loop, daemon=True).start()
+    # Toggle ingestion/training easily for low-latency demo mode
+    ENABLE_INGESTION = True
+    ENABLE_TRAINING = True
 
-    # Load model & tokenizer
+    if ENABLE_INGESTION:
+        threading.Thread(target=continuous_ingestion_loop, daemon=True).start()
+
     model, tokenizer = load_model_and_tokenizer()
     existing_run_id = load_checkpoint_if_available(model)
 
-    # Training manager with AMP
     trainer = TrainingManagerAMP(model, tokenizer, run_id=existing_run_id)
     supervisor = Supervisor(trainer)
 
-    # Start training and supervisor threads
-    threading.Thread(target=trainer.training_loop, daemon=True).start()
-    threading.Thread(target=supervisor.run, daemon=True).start()
+    if ENABLE_TRAINING:
+        threading.Thread(target=trainer.training_loop, daemon=True).start()
+        threading.Thread(target=supervisor.run, daemon=True).start()
 
-    # Initialize multimodal components
     init_multimodal_components(model)
 
-    # Initialize ChatEngine for API
     global chat_engine
     chat_engine = ChatEngine(model, tokenizer, trainer)
 
-    # Run API server in background if enabled
     if CFG.enable_api:
         def run_api():
             uvicorn.run(app, host=CFG.api_host, port=CFG.api_port, log_level="info")
-
         threading.Thread(target=run_api, daemon=True).start()
 
-    # Local REPL remains available
     try:
         epsteingpt_interact(model, tokenizer, trainer)
     finally:
