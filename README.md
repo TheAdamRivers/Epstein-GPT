@@ -1,286 +1,221 @@
 # EpsteinGPT
 
-EpsteinGPT is a **research-focused, epistemically-aware, multimodal LLM system** for deep investigative work over large, messy corpora (declassified files, court records, government archives, etc.).
+EpsteinGPT is a self-hosted, epistemic large language model stack built around an EleutherAI GPT‑Neo 2.7B base model with:
 
-This repository currently contains **two engine variants**:
+- Online ingestion of public documents (JFK archives, OIG reports, etc.)
+- Semantic deduplication using SentenceTransformers + FAISS
+- Epistemic regularization loss for training
+- FastAPI HTTP API exposing an OpenAI‑style `/chat/completions` endpoint
+- Optional multimodal conditioning (images, audio, video) via CLIP and Whisper
+- A simple Streamlit chat UI that talks to the FastAPI backend
 
-- `EpsteinGPT.py` — original single-file implementation (baseline engine)
-- `EpsteinGPTv2.py` — upgraded engine with multimodal caching, improved API responses, and UX-oriented refinements
-- `LICENSE` — project license
-
-Most new users should start with **EpsteinGPTv2** unless you specifically want the original reference version.
-
----
-
-## Which Engine Should I Use?
-
-| File              | Description                                                                                   | Recommended for                                           |
-|-------------------|-----------------------------------------------------------------------------------------------|-----------------------------------------------------------|
-| `EpsteinGPT.py`   | Original single-file engine with ingestion, training, basic multimodal support, and API.     | Reading the original design, baselines, audits.          |
-| `EpsteinGPTv2.py` | Enhanced engine with media caching, safer multimodal handling, answer post-processing, etc.  | Actual use, new deployments, UI integration.             |
-
-If you’re unsure, use **`EpsteinGPTv2.py`**.
+This README describes how to install, configure, and run the full stack locally, and how to interact with it from the browser or from code.
 
 ---
 
-## EpsteinGPTv2 Overview
+## What EpsteinGPT is (non‑technical overview)
 
-`EpsteinGPTv2.py` is a drop-in evolution of the original script that:
+For non‑technical users, EpsteinGPT is a **local AI assistant** that you run on your own machine. Instead of sending data to a third‑party service, the model, database, and all processing stay under your control.
 
-- Keeps the **epistemic training** and ingestion pipeline intact.
-- Adds **robust multimodal handling** (images, audio, video) with:
-  - Safer encoding paths (size checks, error handling).
-  - On-disk **embedding cache** (`./media_cache`) to avoid recomputing for reused files.
-- Enhances the **chat API**:
-  - Adds summary and key points to responses.
-  - Returns a debug block indicating which modalities were successfully encoded.
-- Keeps the **local REPL** and **FastAPI** interface.
-- Is designed to be wrapped by a simple web UI (e.g., Streamlit) for non-technical users.
+EpsteinGPT continuously pulls in public documents (such as declassified archives and government reports), cleans and deduplicates them, and uses them to inform its responses. It is designed to be *epistemic*—focused on sources, uncertainty, and evidence rather than just generating fluent text.
 
-The rest of this README describes **EpsteinGPTv2**. Where differences with the original exist, they’re called out explicitly.
+You can:
+
+- Ask questions from a web chat interface (Streamlit) in your browser.
+- Use a programmatic API (FastAPI) from your own tools or scripts.
+- Optionally enable image, audio, and video understanding for richer queries.
 
 ---
 
-## Feature Summary (v2)
+## Why this project matters
 
-- **Model & Training**
-  - Backbone: `EleutherAI/gpt-neo-2.7B` (configurable).
-  - Mixed-precision (AMP) training on GPU with automatic GradScaler.
-  - Custom **epistemic loss** combining:
-    - Cross-entropy.
-    - Authority/provenance regularization via DAG-style information measures.
-  - Checkpointing to `./checkpoints` with disk-usage–aware pruning.
-  - Supervisor that monitors loss, disk usage, GPU memory, and prunes old checkpoints.
+EpsteinGPT explores what it looks like to build a **vertically integrated, self‑hosted research assistant** instead of depending on opaque cloud models.
 
-- **Data Ingestion**
-  - Periodic crawl of configured public archives (e.g., JFK files, OIG reports, GovernmentAttic).
-  - Support for `.pdf`, `.txt`, `.html` (extensible).
-  - PDF text extraction with PyPDF2, OCR fallback with pdf2image + Tesseract.
-  - Semantic deduplication using Sentence Transformers + FAISS.
-  - Per-document metadata store (JSON + JSONL log) with simple authority heuristics.
+Key aspects of significance:
 
-- **Multimodal Encoders**
-  - **Images:** CLIP (`openai/clip-vit-base-patch32`) for image embeddings.
-  - **Audio:** Whisper (`openai/whisper-small`) for:
-    - Audio embeddings (mean-pooled encoder state).
-    - Optional transcript text.
-  - **Video:** Frame sampling (~1 frame / 3s) + CLIP image encoder; averaged embeddings.
-
-- **Multimodal Fusion**
-  - `MultimodalPrefix` module:
-    - Projects image/audio/video embeddings into LM hidden space via linear layers.
-    - Adds a fused prefix vector to token embeddings before generation.
-  - No special tokens or prompt markers required; fusion happens in embedding space.
-
-- **Media Embedding Cache (v2 only)**
-  - On-disk cache (`./media_cache`) keyed by SHA256 of file bytes.
-  - Safe wrappers:
-    - `safe_encode_image_bytes`.
-    - `safe_encode_audio_bytes`.
-    - `safe_encode_video_bytes`.
-  - Size limits via `max_upload_mb`.
-  - Graceful degradation when media can’t be processed (text-only reply + note).
-
-- **Storage & Observability**
-  - SQLite database (`./epsteingpt.db`) with:
-    - `runs`, `steps`, `docs`, `events`.
-  - Metadata store with:
-    - Buffered in-memory dict.
-    - JSONL append log.
-    - Periodic JSON snapshots.
-  - Supervisor that prints latest loss and performs housekeeping.
-
-- **Interfaces**
-  - **REPL:** terminal-based interactive shell with commands:
-    - `/status`, `/runs`, `/pause`, `/resume`, `/help`.
-  - **HTTP API:** FastAPI app exposing:
-    - `POST /chat/completions` — OpenAI-style chat endpoint.
-  - **Optional Web UI:** Streamlit front-end (`app.py`, not required) for drag-and-drop usage.
-  - Single shared model instance for:
-    - Training (AMP).
-    - REPL generation.
-    - API chat completion.
-
-- **Answer Post-processing (v2 only)**
-  - Takes raw model output and:
-    - Preserves full text.
-    - Produces a short summary.
-    - Extracts a few bullet-style key points.
-  - API responses include full answer, summary, and key points in separate content blocks.
+- **Data provenance and authority**: The system tracks sources, local citation counts, and an authority score per document, enabling reasoning about “where a claim came from” and how trustworthy it might be.
+- **Continuous ingestion and learning**: Ingestion and training loops enable the model to adapt over time to new public records and leaks, instead of relying on static snapshots.
+- **Epistemic loss**: A custom loss term encourages the model not just to predict text, but to balance consistency, disagreement, and authority among sources.
+- **Multimodal architecture**: With CLIP, Whisper, and a multimodal prefix module, the design supports conditioning on images, audio, and video in the same latent space as text.
+- **Privacy and autonomy**: Running locally (or on controlled infrastructure) gives organizations and individuals more control over sensitive workflows than typical SaaS AI tools.
 
 ---
 
-## File Layout
+## Features
 
-In this repo you’ll typically see:
+- **Causal LM backbone**
+  - EleutherAI `gpt-neo-2.7B` via Hugging Face Transformers.
 
-- `EpsteinGPT.py`  
-  Original engine. Older, simpler pipeline. Kept for reference and backwards compatibility.
+- **Training & checkpoints**
+  - Streaming and static dataset support (`EpsteinDataset`, `StreamingEpsteinDataset`).
+  - Epistemic loss combining cross‑entropy with a regularization term.
+  - Checkpointing every N steps with metadata logging to SQLite (`runs`, `steps` tables).
 
-- `EpsteinGPTv2.py`  
-  Upgraded engine. If you’re starting fresh, **use this**.
+- **Ingestion pipeline**
+  - Crawls configured public archives (`archives.gov`, `justice.gov`, `governmentattic.org`, etc.).
+  - Extracts text from PDFs, images (OCR), JSON, and common formats.
+  - Semantic deduplication with SentenceTransformers + FAISS index.
+  - Document registry in SQLite (`docs` table with path, hash, timestamps).
 
-- `LICENSE`  
-  License for this project.
+- **Epistemic metadata and authority scoring**
+  - Heuristics to estimate citation density (patterns like “v.”, “U.S.C.”, “case no.”).
+  - Authority scoring by source type (gov, court, media, unknown) and citation statistics.
 
-- (Optional) `app.py`  
-  A small Streamlit front-end that talks to the v2 HTTP API.
+- **Multimodal encoders (optional)**
+  - Image encoder: CLIP (`openai/clip-vit-base-patch32`).
+  - Audio encoder: Whisper (`openai/whisper-small`).
+  - Video encoder: CLIP on sampled frames.
+  - `MultimodalPrefix` projecting embeddings into LM hidden space and fusing them as a conditioning prefix.
+
+- **FastAPI backend**
+  - `POST /chat/completions?session_id=default` with OpenAI‑style request/response models.
+  - Session‑aware `ChatEngine` storing conversation history per session ID.
+  - Optional debug metadata in responses (e.g., which modalities were used).
+
+- **Streamlit frontend**
+  - Chat UI using `st.chat_message` and `st.chat_input`.
+  - Sends OpenAI‑style JSON payloads and displays multi‑part text responses.
 
 ---
 
-## Requirements (for EpsteinGPTv2)
+## Requirements
 
-Python 3.10+ is recommended.
+- Python 3.10+ (recommended).
+- CPU with sufficient RAM for a 2.7B parameter model; GPU strongly recommended for interactive latency.
+- System dependencies:
+  - Tesseract OCR (for `pytesseract`).
+  - Ghostscript / poppler or equivalent for `pdf2image` (platform‑specific).
 
-### Python packages
-
-Core engine:
+Python packages (install via `pip`):
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # or CPU wheels
-pip install transformers sentence-transformers faiss-cpu
-pip install fastapi uvicorn[standard]
-pip install pillow pytesseract pdf2image PyPDF2 beautifulsoup4 requests
-pip install opencv-python
-pip install python-multipart
+pip install \
+  torch transformers sentence-transformers faiss-cpu \
+  fastapi uvicorn pydantic \
+  streamlit requests \
+  beautifulsoup4 PyPDF2 pdf2image pytesseract Pillow \
+  torchaudio opencv-python
 ```
 
-Optional web UI:
-
-```bash
-pip install streamlit
-```
-
-You also need:
-
-- **Tesseract OCR** installed and available on PATH for image/PDF OCR.  
-- **poppler** for `pdf2image` (platform-specific).  
-- **ffmpeg** for robust video decoding (OpenCV uses system codecs).
+Adjust `faiss-cpu` to a GPU‑enabled FAISS build if desired.
 
 ---
 
-## Configuration (v2)
+## Project structure
 
-`EpsteinGPTv2.py` defines a `Config` class at the top. Key fields:
+Core files and directories:
 
-- **Model / device**
-  - `base_model`: Hugging Face model name (default `EleutherAI/gpt-neo-2.7B`).
-  - `device`: `"cuda"` or `"cpu"`.
+- `EpsteinGPT.py` – initial single‑file implementation with API and training.
+- `EpsteinGPTv2.py` – updated multimodal‑aware version with enhanced chat response structure and post‑processing.
+- `app.py` – Streamlit chat frontend (see below).
+- `.epsteinfiles/` – ingestion corpus directory (auto‑created).
+- `.checkpoints/` – checkpoint files (`.pt`) written by the training manager.
+- `.mediacache/` – cached embeddings for media to avoid recomputation.
+- `.epsteingpt.db` – SQLite database for runs, steps, docs, and events.
 
-- **Data & training**
-  - `data_path`: folder containing ingested files (default `./epstein_files`).
-  - `max_len`, `stride`: sequence length and training stride.
-  - `batch_size`, `epochs`, `lr`, `warmup_ratio`, `weight_decay`, `max_grad_norm`.
+Configuration is embedded in the `Config` class inside `EpsteinGPT.py` / `EpsteinGPTv2.py`.
+
+---
+
+## Configuration
+
+Key `Config` fields (non‑exhaustive):
+
+- **Model & training**
+  - `basemodel = "EleutherAI/gpt-neo-2.7B"`
+  - `device = "cuda" if torch.cuda.is_available() else "cpu"`
+  - `maxlen`, `stride`, `batchsize`, `epochs`, `lr`, `warmupratio`, `weightdecay`, `maxgradnorm`
 
 - **Epistemic loss**
-  - `num_roots`, `lambda_reg`, `sigma_a`, `sigma_h`, `alpha_base`, `rho_base`, `total_steps_cap`.
+  - `numroots`, `lambdareg`, `sigmaa`, `sigmah`, `alphabase`, `rhobase`, `totalstepscap`
 
 - **Ingestion**
-  - `ingestion_interval_sec`.
-  - `keywords`: filter terms for links.
-  - `public_archives`: base URLs to crawl.
-  - `max_new_docs_per_cycle`.
+  - `ingestionintervalsec`
+  - `keywords`
+  - `publicarchives`
+  - `maxnewdocspercycle`
 
-- **Dedup**
-  - `embedding_model_name`.
-  - `dedup_index_path`, `dedup_meta_path`, `dedup_threshold`.
+- **Deduplication**
+  - `embeddingmodelname`
+  - `dedupindexpath`
+  - `dedupmetapath`
+  - `dedupthreshold`
 
-- **Checkpoints & logs**
-  - `checkpoint_dir`, `checkpoint_every_steps`.
-  - `metadata_store_path`, `metadata_log_path`.
-  - `db_path`.
+- **Checkpoints & DB**
+  - `checkpointdir`, `checkpointeverysteps`
+  - `metadatastorepath`, `metadatalogpath`
+  - `dbpath`
 
 - **Supervisor**
-  - `supervisor_interval_sec`.
-  - `max_disk_usage_ratio`.
-  - `max_checkpoints_to_keep`.
+  - `supervisorintervalsec`, `maxdiskusageratio`, `maxcheckpointstokeep`
 
-- **API**
-  - `api_host`, `api_port`, `enable_api`.
+- **API & UI behavior**
+  - `apihost = "0.0.0.0"`
+  - `apiport = 8000`
+  - `enableapi = True`
+  - `enablestreaming` (reserved)
+  - `maxuploadmb`
+  - `safemodedefault`
 
-- **UI / behaviour**
-  - `enable_streaming` (reserved for future WebSocket streaming).
-  - `max_upload_mb`: max media size for backend processing.
-  - `safe_mode_default`: default stance for “cautious” answers.
+- **Media cache & answers**
+  - `mediacachedir`, `reusecachedembeddings`
+  - `maxsummarychars`, `maxsummarybullets`
 
-- **Media cache**
-  - `media_cache_dir`.
-  - `reuse_cached_embeddings`.
-
-- **Answer post-processing**
-  - `max_summary_chars`.
-  - `max_summary_bullets`.
-
-`EpsteinGPT.py` uses a similar but slightly smaller config surface (no media cache and post-processing).
+Modify `Config` to fit your environment before running.
 
 ---
 
-## Running the Engines
+## Running the backend
 
-### Original Engine (`EpsteinGPT.py`)
-
-If you want to run the original version for reference:
-
-```bash
-python EpsteinGPT.py
-```
-
-You’ll get:
-
-- Ingestion pipeline.
-- Training loop.
-- Basic multimodal support.
-- REPL.
-- FastAPI `/chat/completions` (simpler response shape, no summary/bullets/debug).
-
-### Upgraded Engine (`EpsteinGPTv2.py`, recommended)
-
-For the enhanced pipeline:
+Launch the full stack by running `EpsteinGPTv2.py`:
 
 ```bash
 python EpsteinGPTv2.py
 ```
 
-On startup (v2), the system:
+On startup, it will:
 
-1. Initializes SQLite and metadata store.
-2. Starts the ingestion thread.
-3. Loads the GPT-Neo model and tokenizer.
-4. Initializes multimodal encoders and `MultimodalPrefix`.
-5. Loads the latest successful checkpoint if available.
-6. Starts the AMP-enabled training loop.
-7. Starts the supervisor thread.
-8. Starts the FastAPI server (if `enable_api=True`) on `api_host:api_port`.
-9. Enters the interactive REPL.
+- Initialize the SQLite database and metadata store.
+- Load the base model and tokenizer.
+- Optionally restore from the latest good checkpoint.
+- Start ingestion, training, supervisor, and API threads (if enabled in `Config`).
 
-Stopping: `Ctrl+C` in the terminal.
+Console output example:
+
+```text
+EpsteinGPT ready. Type 'help' for commands, 'exit' to quit.
+INFO:     Started server process [PID]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+### REPL commands
+
+In the same terminal, you can interact with the local REPL:
+
+- `status` – show last run ID, last step, latest loss, and doc count.
+- `runs` – list recent runs with timestamps and status.
+- `pause` – request training pause.
+- `resume` – resume training in a new thread.
+- `help` – list commands.
+- Any other input – sent as a prompt directly to the model for an immediate response.
+
+Note: first responses after startup may be slow while the model and supporting components warm up. Subsequent responses are typically faster.
 
 ---
 
-## Using the Local REPL (v2)
+## API: `/chat/completions`
 
-In the REPL:
+### Request format
 
-- Type a natural-language prompt and press Enter to get a model response.
-- Commands:
-  - `/status` — latest run, step, loss, document count.
-  - `/runs` — recent runs.
-  - `/pause` — request training pause.
-  - `/resume` — resume training in a new thread.
-  - `/help` — show commands.
-  - `exit` or `quit` — terminate the program.
+Endpoint:
 
-Generation in the REPL uses the same model that training is updating, protected by a training lock and `torch.inference_mode()`.
+```text
+POST /chat/completions?session_id={session_id}
+```
 
----
-
-## HTTP Chat API (v2)
-
-### Endpoint
-
-`POST /chat/completions`
-
-### Request body (OpenAI-style)
+Body (JSON) conforms to `ChatRequest`:
 
 ```json
 {
@@ -289,19 +224,18 @@ Generation in the REPL uses the same model that training is updating, protected 
     {
       "role": "system",
       "content": [
-        { "type": "text", "text": "You are EpsteinGPT, a factual, source-aware assistant." }
+        {
+          "type": "text",
+          "text": "You are EpsteinGPT, an epistemic AI assistant."
+        }
       ]
     },
     {
       "role": "user",
       "content": [
-        { "type": "text", "text": "Summarize what you know about declassified files." },
         {
-          "type": "image_url",
-          "image_url": {
-            "url": "https://example.com/image.png",
-            "detail": "high"
-          }
+          "type": "text",
+          "text": "Hello"
         }
       ]
     }
@@ -313,44 +247,47 @@ Generation in the REPL uses the same model that training is updating, protected 
 }
 ```
 
-Supported content parts:
+Rules:
 
-- `{"type": "text", "text": "..."}`  
-- `{"type": "image_url", "image_url": {"url": "https://...", "detail": "high"}}`  
-- `{"type": "audio_url", "audio_url": {"url": "https://..."}}`  
-- `{"type": "video_url", "video_url": {"url": "https://..."}}`
+- `messages` must be non‑empty.
+- Each message:
+  - `role` in `"user"`, `"assistant"`, `"system"`.
+  - `content` is a list of parts.
+- Text parts: `{ "type": "text", "text": "..." }`
+- The last message’s `role` **must** be `"user"` or `"system"`; otherwise the server returns `400 Bad Request`.
+- `session_id` controls which server‑side history buffer is used.
 
-For each non-text part, the v2 `ChatEngine`:
+Example curl:
 
-1. Downloads the referenced media bytes.
-2. Validates size against `max_upload_mb`.
-3. Uses the safe encoder wrappers:
-   - `safe_encode_image_bytes`.
-   - `safe_encode_audio_bytes`.
-   - `safe_encode_video_bytes`.
-4. Passes embeddings to `MultimodalPrefix`, which adjusts token embeddings.
-5. Calls `model.generate` with the fused embeddings.
+```bash
+curl -X POST "http://localhost:8000/chat/completions?session_id=default" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"epsteingpt\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}],\"temperature\":0.7,\"top_p\":0.9,\"max_tokens\":64,\"stream\":false}"
+```
 
-### Response shape (v2)
+### Response format
+
+`ChatResponse` example:
 
 ```json
 {
-  "id": "chatcmpl-1739999999999",
+  "id": "chatcmpl-1739976000000",
   "object": "chat.completion",
-  "created": 1739999999,
-  "model": "EleutherAI/gpt-neo-2.7B",
+  "created": 1739976000,
+  "model": "epsteingpt",
   "choices": [
     {
       "index": 0,
       "message": {
         "role": "assistant",
         "content": [
-          { "type": "text", "text": "<full answer>" },
-          { "type": "text", "text": "Summary:\n<short summary>" },
-          { "type": "text", "text": "Key points:\n- bullet 1\n- bullet 2" }
+          {
+            "type": "text",
+            "text": "Hello! How can I help you today?"
+          }
         ],
         "debug": {
-          "image_encoded": true,
+          "image_encoded": false,
           "audio_encoded": false,
           "video_encoded": false
         }
@@ -361,297 +298,274 @@ For each non-text part, the v2 `ChatEngine`:
 }
 ```
 
-If some attached media cannot be processed, an extra text part is appended:
+Typical client logic:
 
-```text
-Note: Some attached files could not be processed. Try a different format or a shorter clip.
-```
-
-The original engine (`EpsteinGPT.py`) uses the same endpoint but returns a simpler text-only content block.
+- Take `choices[0].message`.
+- Iterate `message["content"]`.
+- Concatenate `part["text"]` for all parts where `part["type"] == "text"`.
 
 ---
 
-## Optional Web UI (v2)
+## Streamlit chat app (for non‑technical users)
 
-If you add `app.py` as:
+For non‑technical users, the easiest way to use EpsteinGPT is via a simple chat interface in your browser.
+
+### Step 1: Create `app.py`
+
+Place this file in the same directory as `EpsteinGPTv2.py`:
 
 ```python
-import streamlit as st
-import requests
-import uuid
+import json
+import time
 from typing import List, Dict, Any
 
+import requests
+import streamlit as st
+
+
 API_URL = "http://localhost:8000/chat/completions"
+SESSION_ID = "default"
+REQUEST_TIMEOUT = 300  # seconds
 
-st.set_page_config(page_title="EpsteinGPT (v2)", layout="wide")
 
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+def build_backend_messages(history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    backend_messages: List[Dict[str, Any]] = []
+    for msg in history:
+        role = msg["role"]
+        if role not in ("user", "assistant", "system"):
+            role = "system"
 
-st.title("EpsteinGPT v2")
-
-with st.sidebar:
-    st.header("Session")
-    safe_mode = st.checkbox(
-        "Safe mode (tone down sensitive content)",
-        value=False,
-        help="Adds a soft safety instruction to responses."
-    )
-    if st.button("Clear session"):
-        st.session_state.messages = []
-
-# Render chat history
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["text"])
-
-st.markdown("### Attach media (optional)")
-up_images = st.file_uploader(
-    "Images",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-)
-up_audio = st.file_uploader(
-    "Audio",
-    type=["mp3", "wav", "m4a"],
-    accept_multiple_files=True,
-)
-up_video = st.file_uploader(
-    "Video",
-    type=["mp4", "mov", "mkv"],
-    accept_multiple_files=True,
-)
-
-user_text = st.chat_input("Ask EpsteinGPT anything about your data...")
-
-def build_message_content(user_text: str) -> List[Dict[str, Any]]:
-    content: List[Dict[str, Any]] = []
-    if safe_mode:
-        content.append({
-            "type": "text",
-            "text": "Answer cautiously, focus on verifiable information, avoid sensational language."
-        })
-    if user_text:
-        content.append({"type": "text", "text": user_text})
-    # NOTE: This UI currently does not send media bytes; it just sends text.
-    # You can extend this later to send image/audio/video URLs or base64 if your backend expects them.
-    return content
-
-if user_text:
-    # Show user message in UI
-    with st.chat_message("user"):
-        st.markdown(user_text)
-
-    st.session_state.messages.append({
-        "role": "user",
-        "text": user_text,
-    })
-
-    # Build payload for EpsteinGPTv2 API
-    content = build_message_content(user_text)
-
-    payload = {
-        "model": "epsteingpt",
-        "messages": [
+        backend_messages.append(
             {
-                "role": "system",
+                "role": role,
                 "content": [
                     {
                         "type": "text",
-                        "text": (
-                            "You are EpsteinGPT, a factual, source-aware assistant focused on "
-                            "evidence from declassified documents, public archives, and official records."
-                        ),
+                        "text": msg["content"],
                     }
                 ],
-            },
-            {
-                "role": "user",
-                "content": content,
-            },
-        ],
+            }
+        )
+    return backend_messages
+
+
+def call_backend(history: List[Dict[str, str]]) -> str:
+    messages = build_backend_messages(history)
+
+    if not messages or messages[-1]["role"] not in ("user", "system"):
+        raise ValueError("Last message must be user or system for backend request.")
+
+    payload: Dict[str, Any] = {
+        "model": "epsteingpt",
+        "messages": messages,
         "temperature": 0.7,
         "top_p": 0.9,
-        "max_tokens": 512,
+        "max_tokens": 256,
         "stream": False,
     }
 
-    # Call backend
-    try:
-        with st.spinner("Thinking..."):
-            r = requests.post(API_URL, json=payload, timeout=300)
-            r.raise_for_status()
-            resp = r.json()
+    response = requests.post(
+        f"{API_URL}?session_id={SESSION_ID}",
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
 
-        # Parse response parts
-        parts = resp["choices"][0]["message"]["content"]
-        raw = parts[0]["text"] if parts else ""
-        summary = ""
-        bullets = ""
-        if len(parts) > 1:
-            summary = parts[1]["text"]
-        if len(parts) > 2:
-            bullets = parts[2]["text"]
+    data = response.json()
+    choices = data.get("choices", [])
+    if not choices:
+        raise ValueError(f"No choices in backend response: {json.dumps(data)[:400]}")
 
-        with st.chat_message("assistant"):
-            st.markdown(raw)
-            if summary:
-                with st.expander("Summary"):
-                    st.markdown(summary)
-            if bullets:
-                with st.expander("Key points"):
-                    st.markdown(bullets)
+    message = choices.get("message", {})
+    parts = message.get("content", [])
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "text": raw,
-        })
+    texts: List[str] = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "text":
+            t = part.get("text", "")
+            if isinstance(t, str) and t.strip():
+                texts.append(t.strip())
 
-    except requests.RequestException as e:
-        with st.chat_message("assistant"):
-            st.error(f"Request to EpsteinGPT API failed: {e}")
+    if not texts:
+        return json.dumps(message, ensure_ascii=False)
 
+    return "\n\n".join(texts)
+
+
+st.set_page_config(page_title="EpsteinGPT", page_icon="🤖")
+st.title("EpsteinGPT")
+
+if "messages" not in st.session_state:
+    st.session_state.messages: List[Dict[str, str]] = []
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"] if msg["role"] in ("user", "assistant") else "assistant"):
+        st.markdown(msg["content"])
+
+user_text = st.chat_input("Type a message and press Enter")
+
+if user_text:
+    st.session_state.messages.append({"role": "user", "content": user_text})
+
+    with st.chat_message("user"):
+        st.markdown(user_text)
+
+    with st.chat_message("assistant"):
+        with st.spinner("EpsteinGPT is thinking..."):
+            start = time.time()
+            try:
+                assistant_text = call_backend(st.session_state.messages)
+                elapsed = time.time() - start
+
+                st.markdown(assistant_text)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": assistant_text}
+                )
+                st.caption(f"Response time: {elapsed:.2f} s")
+
+            except requests.HTTPError as http_err:
+                status = http_err.response.status_code
+                try:
+                    err_body = http_err.response.json()
+                    err_text = json.dumps(err_body, ensure_ascii=False)
+                except Exception:
+                    err_text = http_err.response.text[:400]
+                st.error(f"Backend HTTP {status}: {err_text}")
+
+            except Exception as e:
+                st.error(f"Client error: {e}")
 ```
 
-Run:
+### Step 2: Start the backend
+
+In one terminal:
+
+```bash
+python EpsteinGPTv2.py
+```
+
+Wait until you see “Application startup complete” and the Uvicorn line with port 8000.
+
+### Step 3: Start the chat app
+
+In another terminal:
 
 ```bash
 streamlit run app.py
 ```
 
-This gives you:
-
-- Chat window with history.
-- Drag-and-drop media inputs.
-- Summary and key-point expanders.
-- Safe-mode toggle for softer answers.
+Your browser will open (or you can navigate to `http://localhost:8501`). You should see a chat window titled “EpsteinGPT”. Type “hello” and press Enter. The first answer may take some time; later exchanges are usually faster.
 
 ---
 
-## Non-Technical Overview
+## Multimodal usage (advanced)
 
-If you’re not a programmer, here’s what EpsteinGPT actually does for you in plain language.
+The Chat API supports image, audio, and video parts using URL references.
 
-### What EpsteinGPT Is
+- Image:
 
-EpsteinGPT is like a **research assistant that never gets tired**.  
-You give it a topic or a question, and it:
+  ```json
+  {
+    "type": "image_url",
+    "image_url": {
+      "url": "https://example.com/image.png",
+      "detail": "high"
+    }
+  }
+  ```
 
-- Hunts through large collections of documents you’ve fed it (like PDFs, web archives, or text files).
-- Reads and remembers important details.
-- Uses that knowledge to answer your questions as a conversational assistant.
+- Audio:
 
-You don’t need to understand how the AI is built to use it. Once it’s running, you can talk to it like you would to any other modern AI chatbot.
+  ```json
+  {
+    "type": "audio_url",
+    "audio_url": {
+      "url": "https://example.com/audio.wav"
+    }
+  }
+  ```
 
-### What Makes It Different
+- Video:
 
-Most chatbots just “talk”; EpsteinGPT is designed to **investigate**:
+  ```json
+  {
+    "type": "video_url",
+    "video_url": {
+      "url": "https://example.com/video.mp4"
+    }
+  }
+  ```
 
-- It prefers **official sources** (like court records and government archives) over random blogs or social media.
-- It keeps track of where its information comes from and how trustworthy each document seems.
-- It can process **text, images, audio, and video**, not just plain text.
-- It tries to present answers with a short summary and key points, so dense material is easier to digest.
+When present in the last user message, the backend will:
 
-In other words, it’s built to be skeptical and evidence-focused, not just fluent.
+- Download the referenced media (up to `maxuploadmb` megabytes).
+- Compute modality‑specific embeddings via `ImageEncoder`, `AudioEncoder`, or `VideoEncoder`.
+- Fuse them with text via `MultimodalPrefix` and call `model.generate` with `inputs_embeds`.
 
-### How You Use It Day-to-Day
-
-Once someone with technical skills sets it up, you can use EpsteinGPT in two main ways:
-
-1. **Chat in a terminal window (REPL)**  
-   - You type a question, it types an answer.  
-   - You can also run simple commands to check its status (how much it has trained, how many documents it has ingested, etc.).
-
-2. **Use it through a web UI or chat API**  
-   - A simple web app can let you drag-and-drop images, audio, or video and ask questions about them.
-   - Any app that can talk to an OpenAI-style chat API can talk to EpsteinGPT instead.
-
-### What It Can Help You Do
-
-For non-technical investigators, journalists, or researchers, EpsteinGPT can:
-
-- Scan huge document dumps and help you **find connections** (names, places, dates, cases) that are easy to miss.
-- Summarize long reports into something you can read in a few minutes.
-- Cross-reference text with images, audio clips, or videos to build a fuller picture.
-- Keep working in the background—downloading, cleaning, deduplicating, and learning from new material.
-
-Think of it as a **persistent, detail-obsessed assistant** that keeps your research organized and helps you ask better questions.
-
-### What You Still Need a Human For
-
-EpsteinGPT doesn’t replace human judgment:
-
-- It can surface patterns and evidence, but **you** decide what is meaningful or actionable.
-- It can’t guarantee every source is honest or every document is complete.
-- It’s a tool for **augmenting** your investigation, not a final authority.
-
-If you can type a question into a search bar, you can use EpsteinGPT—  
-the difference is that instead of just listing links, it works through your data with the patience and thoroughness of a full-time research team.
+This can increase compute and latency, so start with text‑only usage if you are on a limited machine.
 
 ---
 
-## What Is The Significance Of EpsteinGPT?
+## Ingestion and training internals (technical users)
 
-> The significance of this project lies in its ability to act as a tireless, objective digital detective that can process mountains of complex information faster and more reliably than a human team.  
->  
-> Here is why this project is important and what makes it significant in non-technical terms:  
->  
-> **1. It Finds the "Needle in the Haystack"**  
-> The sheer volume of declassified documents, court filings, and audio recordings related to high-profile cases is overwhelming. This project is significant because it automatically hunts for this data across the web, reads through it all, and organizes it into a single, searchable brain. It ensures that no detail is missed simply because a human didn't have the time to read page 500 of a 1,000-page document.  
->  
-> **2. It Prioritizes Facts Over Opinions**  
-> One of the most important features is its "Truth Filter" (the Epistemic Loss function). In an era of misinformation, this system is programmed to:  
->  
-> - Check the Source: It gives much more importance to an official court transcript or a government archive than to a news article or a blog post.  
-> - Look for Evidence: It looks for legal citations (like specific law codes or case numbers) to decide how "authoritative" a document is.  
->  
-> This means the AI is less likely to be "brainwashed" by rumors and more likely to stick to verifiable facts.  
->  
-> **3. It "Sees" and "Hears" the Full Story**  
-> Most AI systems only understand text. This project is significant because it has multi-sensory intelligence:  
->  
-> - It can listen to audio recordings of depositions or hearings.  
-> - It can analyze photos or video evidence.  
->  
-> This allows the AI to connect a name mentioned in a court document to a person seen in a video or heard in an audio clip, creating a much more complete picture of an investigation.  
->  
-> **4. It is Designed for Independence (Sovereignty)**  
-> The code is built to run on your own hardware rather than relying on a big tech company's servers.  
->  
-> - No Censorship: Because it is "sovereign," it can process sensitive topics without being shut down or filtered by external companies.  
-> - Self-Managing: It even has its own "Janitor" (the Supervisor) that manages its own storage space, ensuring it doesn't crash your computer as it grows smarter.  
->  
-> **Summary: Why it Matters**  
-> The EpsteinGPT project is important because it provides a way to conduct deep, automated investigative research that is grounded in high-quality evidence. It levels the playing field, giving independent researchers a powerful tool that can process information with the speed of a machine but the skepticism of a veteran investigator.
+- **Ingestion loop** (`continuous_ingestion_loop`):
+  - Periodically fetches new URLs from configured archives.
+  - Filters by extension and keywords.
+  - Downloads, extracts text, deduplicates, and stores metadata plus content hash.
+
+- **Semantic dedup** (`SemanticDeduper`):
+  - Uses SentenceTransformers to embed text.
+  - FAISS index for similarity.
+  - Threshold‑based duplicate detection and incremental index writes.
+
+- **Training managers** (`TrainingManager`, `TrainingManagerAMP`):
+  - Use either standard or AMP training loops.
+  - Sample source metadata to feed into the epistemic loss.
+  - Write steps and checkpoints and update the `runs` table.
+
+- **Supervisor** (`Supervisor`):
+  - Monitors latest loss, disk usage, and GPU memory.
+  - Enforces maximum checkpoint count and logs health events.
+
+These components are enabled by default but can be selectively disabled by commenting out their thread starts at the bottom of `EpsteinGPTv2.py` for a lean inference‑only setup.
+
+---
+
+## Troubleshooting
+
+- **Streamlit never returns (“EpsteinGPT is thinking...”)**
+  - Check the backend logs for `POST /chat/completions`. If no request shows up, verify `API_URL` in `app.py`.
+  - If the POST appears but there is no response, the model may still be warming up or `generate` is slow for your hardware; try reducing `max_tokens` in the client payload.
+
+- **HTTP 400 from `/chat/completions`**
+  - Ensure `messages` is non‑empty and that the last `role` is `"user"` or `"system"`.
+  - Confirm each message has `content` as a list with at least one `"type": "text"` part containing non‑empty text.
+
+- **High memory / disk usage**
+  - Decrease batch size, `maxlen`, and `epochs` in `Config`.
+  - Consider disabling training and/or ingestion threads if you only need inference.
+
+- **OCR or PDF issues**
+  - Verify system installs for `tesseract` and PDF rendering.
+  - Check that `pdf2image` and `pytesseract` run successfully on sample files.
 
 ---
 
 ## Author
 
-Developed by **Adam Rivers** — CEO, **Synthicsoft Labs**.
+- **Author**: Adam Rivers  
+- **Role**: CEO, SynthicSoft Labs  
+- **Website**: https://synthicsoftlabs.com  
 
 ---
 
-## License, Usage, and Disclaimer
+## Disclaimer
 
-See `LICENSE` in this repository for licensing details.
+EpsteinGPT is an experimental research system. It is **not** a product, and it comes with **no warranty or guarantee of accuracy**.
 
-EpsteinGPT is a research / experimental system intended as a reference implementation of:
+- The model can hallucinate, misinterpret documents, and produce incorrect or misleading answers.
+- Ingestion sources include public archives and reports; their presence in the corpus does not imply endorsement or verification.
+- This stack is **not** intended for medical, legal, financial, or safety‑critical decision making.
+- You are responsible for complying with all relevant laws, regulations, and third‑party model/data licenses when running or modifying this code.
 
-- epistemic training concepts, and  
-- multimodal conditioning on top of a legacy LM.
-
-If you deploy it in production, you are responsible for:
-
-- securing the ingestion pipeline,  
-- complying with licenses and terms for all models and datasets,  
-- ensuring resource usage (GPU/CPU/memory) fits your environment.
-
-**Disclaimer**
-
-- EpsteinGPT is provided **as-is**, with no warranty or guarantee of accuracy, reliability, or fitness for any particular purpose.  
-- The system may surface incorrect, incomplete, or outdated information and should **not** be treated as a definitive source of truth.  
-- It may process and reason over sensitive or controversial material. How you use its outputs—legally, ethically, and operationally—is entirely your responsibility.  
-- The author and contributors are not liable for any decisions, actions, or consequences arising from the use of this software or any models, data, or services it relies on.
+Use EpsteinGPT at your own risk and always independently verify important information against primary sources.
