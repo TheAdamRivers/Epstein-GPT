@@ -379,64 +379,78 @@ If you add `app.py` as:
 import streamlit as st
 import requests
 import uuid
+from typing import List, Dict, Any
 
 API_URL = "http://localhost:8000/chat/completions"
 
-st.set_page_config(page_title="EpsteinGPT", layout="wide")
+st.set_page_config(page_title="EpsteinGPT (v2)", layout="wide")
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-st.title("EpsteinGPT (v2)")
+st.title("EpsteinGPT v2")
 
 with st.sidebar:
     st.header("Session")
-    safe_mode = st.checkbox("Safe mode (tone down sensitive content)", value=False)
+    safe_mode = st.checkbox(
+        "Safe mode (tone down sensitive content)",
+        value=False,
+        help="Adds a soft safety instruction to responses."
+    )
     if st.button("Clear session"):
         st.session_state.messages = []
 
+# Render chat history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["text"])
-        for media in m.get("media", []):
-            if media["type"] == "image":
-                st.image(media["data"])
-            elif media["type"] == "audio":
-                st.audio(media["data"])
-            elif media["type"] == "video":
-                st.video(media["data"])
 
 st.markdown("### Attach media (optional)")
-up_images = st.file_uploader("Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-up_audio  = st.file_uploader("Audio", type=["mp3", "wav", "m4a"], accept_multiple_files=True)
-up_video  = st.file_uploader("Video", type=["mp4", "mov", "mkv"], accept_multiple_files=True)
+up_images = st.file_uploader(
+    "Images",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+)
+up_audio = st.file_uploader(
+    "Audio",
+    type=["mp3", "wav", "m4a"],
+    accept_multiple_files=True,
+)
+up_video = st.file_uploader(
+    "Video",
+    type=["mp4", "mov", "mkv"],
+    accept_multiple_files=True,
+)
 
 user_text = st.chat_input("Ask EpsteinGPT anything about your data...")
 
+def build_message_content(user_text: str) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = []
+    if safe_mode:
+        content.append({
+            "type": "text",
+            "text": "Answer cautiously, focus on verifiable information, avoid sensational language."
+        })
+    if user_text:
+        content.append({"type": "text", "text": user_text})
+    # NOTE: This UI currently does not send media bytes; it just sends text.
+    # You can extend this later to send image/audio/video URLs or base64 if your backend expects them.
+    return content
+
 if user_text:
-    media_preview = []
+    # Show user message in UI
     with st.chat_message("user"):
         st.markdown(user_text)
-        for f in up_images or []:
-            st.image(f)
-            media_preview.append({"type": "image", "data": f})
-        for f in up_audio or []:
-            st.audio(f)
-            media_preview.append({"type": "audio", "data": f})
-        for f in up_video or []:
-            st.video(f)
-            media_preview.append({"type": "video", "data": f})
 
-    st.session_state.messages.append({"role": "user", "text": user_text, "media": media_preview})
+    st.session_state.messages.append({
+        "role": "user",
+        "text": user_text,
+    })
 
-    content = [{"type": "text", "text": user_text}]
-    if safe_mode:
-        content.insert(0, {
-            "type": "text",
-            "text": "Answer cautiously and avoid sensational language."
-        })
+    # Build payload for EpsteinGPTv2 API
+    content = build_message_content(user_text)
 
     payload = {
         "model": "epsteingpt",
@@ -444,12 +458,18 @@ if user_text:
             {
                 "role": "system",
                 "content": [
-                    {"type": "text", "text": "You are EpsteinGPT, a factual, source-aware assistant."}
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are EpsteinGPT, a factual, source-aware assistant focused on "
+                            "evidence from declassified documents, public archives, and official records."
+                        ),
+                    }
                 ],
             },
             {
                 "role": "user",
-                "content": content
+                "content": content,
             },
         ],
         "temperature": 0.7,
@@ -458,29 +478,41 @@ if user_text:
         "stream": False,
     }
 
-    with st.spinner("Thinking..."):
-        r = requests.post(API_URL, json=payload, timeout=300)
-        r.raise_for_status()
-        resp = r.json()
-        parts = resp["choices"]["message"]["content"]
-        raw = parts["text"]
+    # Call backend
+    try:
+        with st.spinner("Thinking..."):
+            r = requests.post(API_URL, json=payload, timeout=300)
+            r.raise_for_status()
+            resp = r.json()
+
+        # Parse response parts
+        parts = resp["choices"][0]["message"]["content"]
+        raw = parts[0]["text"] if parts else ""
         summary = ""
         bullets = ""
         if len(parts) > 1:
-            summary = parts["text"] [ppl-ai-file-upload.s3.amazonaws](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/150438246/4e7c4877-fb74-4abb-ae1e-5578907ba14b/paste.txt)
+            summary = parts[1]["text"]
         if len(parts) > 2:
-            bullets = parts["text"] [ppl-ai-file-upload.s3.amazonaws](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/150438246/bea6e700-7764-4ccf-a844-600d5ad2c9b6/paste.txt)
+            bullets = parts[2]["text"]
 
-    with st.chat_message("assistant"):
-        st.markdown(raw)
-        if summary:
-            with st.expander("Summary"):
-                st.markdown(summary)
-        if bullets:
-            with st.expander("Key points"):
-                st.markdown(bullets)
+        with st.chat_message("assistant"):
+            st.markdown(raw)
+            if summary:
+                with st.expander("Summary"):
+                    st.markdown(summary)
+            if bullets:
+                with st.expander("Key points"):
+                    st.markdown(bullets)
 
-    st.session_state.messages.append({"role": "assistant", "text": raw, "media": []})
+        st.session_state.messages.append({
+            "role": "assistant",
+            "text": raw,
+        })
+
+    except requests.RequestException as e:
+        with st.chat_message("assistant"):
+            st.error(f"Request to EpsteinGPT API failed: {e}")
+
 ```
 
 Run:
