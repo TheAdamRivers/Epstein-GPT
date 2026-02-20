@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/Epstein-GPT_social_preview_1280x640.jpg" alt="Epstein-GPT Banner" width="100%">
+</p>
+
 # EpsteinGPT
 
 EpsteinGPT is a self-hosted, epistemic large language model stack built around an EleutherAI GPT‑Neo 2.7B base model with:
